@@ -1,0 +1,3 @@
+-- SCHEMA: users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT, tags JSON, embedding VECTOR(3))
+{"id":1,"name":"Yuki","age":16,"tags":["new"],"embedding":[1,0,0]}
+{"id":2,"name":"Taro","age":20,"tags":[],"embedding":[0,1,0]}

@@ -1,0 +1,6 @@
+/target/
+*.jsqnl.log
+*.jsqnl.idx
+/.venv-parquet/
+*.jsqnl.seek.sqlite
+*.jsqnl.seek.sqlite.seal

@@ -1,0 +1,4 @@
+﻿-- JSQNL: 1
+-- SCHEMA: records (id INT PRIMARY KEY, description TEXT NOT NULL, flag BOOL, meta JSON, v VECTOR(2), weight FLOAT)
+{"id":-9223372036854775808,"description":"雪 🚀 \"引用\"\n\t\\","flag":true,"meta":{"nested":[null,{"x":"\u00e9"}]},"v":[1,-0.5],"weight":2.5}
+{"id":9223372036854775807,"description":"second","meta":null,"flag":false}
