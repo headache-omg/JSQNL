@@ -2,7 +2,7 @@
 
 [日本語](../ja/README.md) · [English](../en/README.md) · [繁體中文](../zh-Hant/README.md) · [한국어](../ko/README.md) · [Français](../fr/README.md) · [Italiano](../it/README.md) · [Português](../pt/README.md) · [Русский](../ru/README.md)
 
-JSQNL（JSON Structured Query & Neural Lines）は、JSON Linesでデータを記述し、SQL風の文で検索・更新するローカルデータベースです。単独のRust CLIとして動作します。
+JSQNLは、JSON Linesでデータを記述し、SQL風の文で検索・更新するローカルデータベースです。単独のRust CLIとして動作します。
 
 ## 実行する
 
