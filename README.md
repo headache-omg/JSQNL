@@ -1,6 +1,6 @@
-# JSQNL v0.1
+# JSQNL
 
-JSQNL (JSON Structured Query & Neural Lines) is a local, embeddable database written in Rust. Store data as schema-validated JSON Lines and query it with SQL-style statements. Use the command-line tools or call the same query engine from a Rust application.
+JSQNL is a local, embeddable database written in Rust. Store data as schema-validated JSON Lines and query it with SQL-style statements. Use the command-line tools or call the same query engine from a Rust application.
 
 ## Documentation
 
