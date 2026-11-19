@@ -1,4 +1,6 @@
-use crate::engine::{JoinVisitor, Row, field, integral_literal, join_key_names, select_references};
+use crate::engine::{
+    JoinVisitor, ResultSpill, Row, field, integral_literal, join_key_names, select_references,
+};
 use crate::scratch::{KeyValidation, PartitionWriters, Scratch};
 use crate::storage::{BaseRead, walk_base};
 use crate::syntax::{Predicate, SelectOptions};
@@ -150,6 +152,7 @@ pub(crate) struct GraceStats {
     pub bytes: u64,
     pub spill_bytes: u64,
     pub skew_partitions: u64,
+    pub result_spill: ResultSpill,
 }
 
 pub(crate) fn execute(
@@ -296,7 +299,8 @@ pub(crate) fn execute(
     Ok(GraceStats {
         rows,
         bytes,
-        spill_bytes: spill_bytes + aggregate_spill.bytes(),
+        spill_bytes,
+        result_spill: aggregate_spill,
         skew_partitions,
     })
 }

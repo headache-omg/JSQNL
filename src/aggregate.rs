@@ -1,3 +1,4 @@
+use crate::engine::RowOrder;
 use crate::grace_join::hash_key;
 use crate::scratch::{PartitionWriters, Scratch, ScratchSlot, configured_bytes};
 use anyhow::{Context, Result};
@@ -13,15 +14,16 @@ use std::rc::Rc;
 
 const PARTITIONS: usize = 256;
 pub(crate) const DEFAULT_BUDGET: u64 = 16 * 1024 * 1024;
-const UPSERT: &str = "INSERT INTO groups VALUES (?1, ?2, ?3, ?4)
+const UPSERT: &str = "INSERT INTO groups VALUES (?1, ?2, ?3, ?4, ?5)
     ON CONFLICT(key) DO UPDATE SET
         total = groups.total + excluded.total,
-        payload = CASE WHEN excluded.first_id < groups.first_id THEN excluded.payload ELSE groups.payload END,
-        first_id = min(groups.first_id, excluded.first_id)";
+        payload = CASE WHEN (excluded.first_left, excluded.first_right) < (groups.first_left, groups.first_right) THEN excluded.payload ELSE groups.payload END,
+        first_right = CASE WHEN (excluded.first_left, excluded.first_right) < (groups.first_left, groups.first_right) THEN excluded.first_right ELSE groups.first_right END,
+        first_left = min(groups.first_left, excluded.first_left)";
 
 #[derive(Serialize, Deserialize)]
 struct Partial {
-    id: u64,
+    id: RowOrder,
     count: u64,
     values: Vec<Value>,
 }
@@ -84,7 +86,8 @@ fn upsert(insert: &mut Statement<'_>, key: String, group: Partial) -> Result<()>
     insert
         .execute(params![
             key,
-            group.id,
+            group.id.0,
+            group.id.1,
             group.count,
             serde_json::to_string(&group.values)?
         ])
@@ -123,7 +126,7 @@ impl Spill {
     fn finish(
         mut self,
         budget: u64,
-        emit: &mut impl FnMut(u64, u64, Vec<Value>) -> Result<()>,
+        emit: &mut impl FnMut(RowOrder, u64, Vec<Value>) -> Result<()>,
     ) -> Result<u64> {
         std::mem::take(&mut self.partitions).finish()?;
         let mut written = self.bytes.iter().sum();
@@ -143,7 +146,7 @@ impl Spill {
         &self,
         path: &Path,
         budget: u64,
-        emit: &mut impl FnMut(u64, u64, Vec<Value>) -> Result<()>,
+        emit: &mut impl FnMut(RowOrder, u64, Vec<Value>) -> Result<()>,
     ) -> Result<u64> {
         let mut input = BufReader::with_capacity(128 * 1024, File::open(path)?);
         let mut line = String::new();
@@ -166,12 +169,12 @@ impl Spill {
         groups: Groups,
         input: &mut impl BufRead,
         line: &mut String,
-        emit: &mut impl FnMut(u64, u64, Vec<Value>) -> Result<()>,
+        emit: &mut impl FnMut(RowOrder, u64, Vec<Value>) -> Result<()>,
     ) -> Result<u64> {
         let name = "aggregation.sqlite";
         let (mut db, reservation) = self.root.reserve_sqlite(name)?;
         db.execute_batch("CREATE TABLE groups (
-            key TEXT PRIMARY KEY, first_id INTEGER NOT NULL, total INTEGER NOT NULL, payload TEXT NOT NULL
+            key TEXT PRIMARY KEY, first_left INTEGER NOT NULL, first_right INTEGER NOT NULL, total INTEGER NOT NULL, payload TEXT NOT NULL
         ) WITHOUT ROWID")?;
         let tx = db.transaction()?;
         {
@@ -185,13 +188,14 @@ impl Spill {
         }
         tx.commit()?;
         {
-            let mut select = db.prepare("SELECT first_id, total, payload FROM groups")?;
+            let mut select =
+                db.prepare("SELECT first_left, first_right, total, payload FROM groups")?;
             let mut cursor = select.query([])?;
             while let Some(row) = cursor.next()? {
                 emit(
-                    row.get(0)?,
-                    row.get(1)?,
-                    crate::internal_json::decode(row.get_ref(2)?.as_str()?.as_bytes())?,
+                    (row.get(0)?, row.get(1)?),
+                    row.get(2)?,
+                    crate::internal_json::decode(row.get_ref(3)?.as_str()?.as_bytes())?,
                 )?;
             }
         }
@@ -223,7 +227,7 @@ impl Aggregation {
         })
     }
 
-    pub(crate) fn push(&mut self, id: u64, values: Vec<Value>) -> Result<()> {
+    pub(crate) fn push(&mut self, id: RowOrder, values: Vec<Value>) -> Result<()> {
         let key = key(&values)?;
         let group = Partial {
             id,
@@ -246,7 +250,7 @@ impl Aggregation {
 
     pub(crate) fn finish(
         self,
-        mut emit: impl FnMut(u64, u64, Vec<Value>) -> Result<()>,
+        mut emit: impl FnMut(RowOrder, u64, Vec<Value>) -> Result<()>,
     ) -> Result<u64> {
         if let Some(spill) = self.spill {
             return spill.finish(self.budget, &mut emit);

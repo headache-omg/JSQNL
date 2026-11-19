@@ -1,5 +1,5 @@
 use crate::disk_index;
-use crate::engine::Database;
+use crate::engine::{Database, ResultSpill};
 use crate::syntax::{Predicate, SelectOptions, Statement};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -98,6 +98,22 @@ pub struct QueryReport {
 }
 
 impl QueryReport {
+    pub(crate) fn record_spill(&mut self, spill: ResultSpill) {
+        if spill.group != 0
+            && let Some(index) = self.operators.iter().position(|op| *op == "group")
+        {
+            self.operators.insert(index, "external_hash_aggregation");
+        }
+        if spill.sort != 0
+            && let Some(operator) = self.operators.iter_mut().find(|op| **op == "sort")
+        {
+            *operator = "external_sort";
+        }
+        if spill.bytes() != 0 {
+            self.spill_bytes_written = Some(self.spill_bytes_written.unwrap_or(0) + spill.bytes());
+        }
+    }
+
     pub(crate) fn new(access: AccessPath, statements: &[(u64, Statement)]) -> Self {
         let mut operators = vec![match access {
             AccessPath::SequentialScan => "sequential_scan",

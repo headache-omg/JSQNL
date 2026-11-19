@@ -332,7 +332,9 @@ impl PartialEq for SqlKey {
 
 impl Eq for SqlKey {}
 
-pub(crate) type OrderedRow = (u64, Vec<Value>, Value);
+// Stable source IDs survive changes to join partitioning and spill order.
+pub(crate) type RowOrder = (u64, u64);
+pub(crate) type OrderedRow = (RowOrder, Vec<Value>, Value);
 
 pub(crate) type JoinVisitor<'a> = dyn FnMut(u64, &Row, Option<(u64, &Row)>) -> Result<()> + 'a;
 
@@ -445,6 +447,10 @@ impl<'a> SelectRows<'a> {
     }
 
     pub(crate) fn push(&mut self, id: u64, row: &Row) -> Result<Option<Value>> {
+        self.push_ordered(id, row, (id, 0))
+    }
+
+    fn push_ordered(&mut self, id: u64, row: &Row, order: RowOrder) -> Result<Option<Value>> {
         let position = self.matched;
         self.matched += 1;
         if self.keep == Some(0) {
@@ -452,7 +458,7 @@ impl<'a> SelectRows<'a> {
         }
         if let Some(groups) = &mut self.groups {
             groups.push(
-                id,
+                order,
                 self.options
                     .group
                     .iter()
@@ -471,7 +477,7 @@ impl<'a> SelectRows<'a> {
                 .iter()
                 .map(|(column, _)| field(id, row, column))
                 .collect();
-            sorter.push((id, keys, Value::Object(project(id, row, self.columns))))?;
+            sorter.push((order, keys, Value::Object(project(id, row, self.columns))))?;
             return Ok(None);
         }
         Ok(self
@@ -496,7 +502,7 @@ impl<'a> SelectRows<'a> {
                 if let Some(name) = &self.options.count {
                     row.insert(name.clone(), Value::from(count));
                 }
-                if let Some(value) = results.push(id, &row)? {
+                if let Some(value) = results.push_ordered(id.0, &row, id)? {
                     emit(value)?;
                 }
                 Ok(())
@@ -882,7 +888,7 @@ impl Database {
         right_rows: impl IntoIterator<Item = (u64, R)>,
         scan_left: impl FnOnce(&mut dyn FnMut(u64, &Row) -> Result<()>) -> Result<()>,
         emit: impl FnMut(Value) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<ResultSpill> {
         self.join_with_pairs(
             table,
             columns,
@@ -912,7 +918,6 @@ impl Database {
             },
             emit,
         )
-        .map(|_| ())
     }
 
     pub(crate) fn join_with_pairs(
@@ -1029,7 +1034,8 @@ impl Database {
                 })
                 .collect();
             if predicate.is_none_or(|filter| matches(filter, sequence, &row))
-                && let Some(value) = results.push(sequence, &row)?
+                && let Some(value) =
+                    results.push_ordered(sequence, &row, (left_id, hit.map_or(0, |(id, _)| id)))?
             {
                 emit(value)?;
             }

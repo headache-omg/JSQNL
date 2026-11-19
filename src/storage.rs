@@ -552,13 +552,15 @@ pub(crate) fn query(
                         options,
                         &mut emit,
                     )?;
-                    return Ok(QueryReport {
+                    let mut report = QueryReport {
                         rows_read: stats.rows,
                         base_bytes_read: stats.bytes,
                         spill_bytes_written: Some(stats.spill_bytes),
                         oversized_partitions: Some(stats.skew_partitions),
                         ..QueryReport::new(AccessPath::GraceHashJoin, &statements)
-                    });
+                    };
+                    report.record_spill(stats.result_spill);
+                    return Ok(report);
                 }
                 BasePlan::Join { indexed_validation } => {
                     let right_name = &options
@@ -615,7 +617,7 @@ pub(crate) fn query(
                     )?;
                     let mut probe_rows = 0;
                     let mut probe_bytes = 0;
-                    db.join_rows(
+                    let spilled = db.join_rows(
                         table,
                         columns.as_deref(),
                         predicate.as_ref(),
@@ -646,11 +648,13 @@ pub(crate) fn query(
                         },
                         &mut emit,
                     )?;
-                    return Ok(QueryReport {
+                    let mut report = QueryReport {
                         rows_read: rows + probe_rows,
                         base_bytes_read: bytes + probe_bytes,
                         ..QueryReport::new(AccessPath::StreamingJoin, &statements)
-                    });
+                    };
+                    report.record_spill(spilled);
+                    return Ok(report);
                 }
             };
             let spilled = results.finish_with(&mut emit)?;
@@ -659,17 +663,10 @@ pub(crate) fn query(
                 base_bytes_read: bytes,
                 ..QueryReport::new(access, &statements)
             };
-            if spilled.group != 0 {
-                report.operators.insert(1, "external_hash_aggregation");
+            if validation_bytes != 0 {
+                report.spill_bytes_written = Some(validation_bytes);
             }
-            if spilled.sort != 0 {
-                if let Some(operator) = report.operators.iter_mut().find(|op| **op == "sort") {
-                    *operator = "external_sort";
-                }
-            }
-            if spilled.bytes() + validation_bytes != 0 {
-                report.spill_bytes_written = Some(spilled.bytes() + validation_bytes);
-            }
+            report.record_spill(spilled);
             return Ok(report);
         }
     }
