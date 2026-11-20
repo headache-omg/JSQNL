@@ -23,6 +23,15 @@ def finite_number(text):
     return value
 
 
+def parse_integer(text):
+    if text == "-0":
+        return -0.0
+    value = int(text)
+    if -(2**63) <= value < 2**64:
+        return value
+    return finite_number(text)
+
+
 def is_number(value):
     return type(value) in (int, float)
 
@@ -44,7 +53,8 @@ def valid(value, kind, required, dimension):
 
 
 def read_schema(text):
-    match = re.fullmatch(rf"({IDENTIFIER})\s*\((.*)\)\s*;?\s*(?:--.*)?", text)
+    definition = text.split("--", 1)[0]
+    match = re.fullmatch(rf"({IDENTIFIER})\s*\((.*)\)\s*;?\s*", definition)
     if not match:
         reject("invalid SCHEMA")
     name, raw_columns = match.groups()
@@ -80,8 +90,10 @@ def read(path):
     schemas = {}
     tables = {}
     current = None
-    with open(path, encoding="utf-8-sig", newline="") as source:
+    with open(path, encoding="utf-8-sig", newline="\n") as source:
         for number, line in enumerate(source, 1):
+            if "\r" in line.removesuffix("\n").removesuffix("\r"):
+                reject("invalid physical line")
             text = line.strip()
             header = re.fullmatch(r"--\s*JSQNL:\s*(.*)", text, re.IGNORECASE)
             if header:
@@ -100,10 +112,8 @@ def read(path):
                 continue
             if current is None:
                 reject("JSONL row before SCHEMA")
-            if "\r" in line.rstrip("\r\n"):
-                reject("invalid physical line")
             row = json.loads(text, parse_constant=reject, parse_float=finite_number,
-                             parse_int=lambda n: -0.0 if n == "-0" else int(n))
+                             parse_int=parse_integer)
             if not isinstance(row, dict):
                 reject("expected a JSON object")
             # Disallow isolated surrogate escapes throughout the object.
@@ -127,3 +137,4 @@ if __name__ == "__main__":
         print(json.dumps(read(sys.argv[1])[sys.argv[2]], ensure_ascii=False, allow_nan=False))
     except (ValueError, KeyError, OSError) as error:
         sys.exit(str(error))
+

@@ -14,7 +14,7 @@ fn set(slot: &mut Option<OsString>, key: &str, value: OsString) -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    jsqnl::recover_temporary_files()?;
+    let _ = jsqnl::recover_temporary_files();
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_none_or(|arg| arg == "--help" || arg == "-h") {
         println!("{USAGE}");

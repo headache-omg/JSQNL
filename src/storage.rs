@@ -681,10 +681,11 @@ pub(crate) fn query(
     let mut result_bytes = 0;
     let result_limit = crate::limits::materialized()?;
     for (offset, statement) in statements {
-        let (pending, selected) = store
+        let (pending, selected, spill) = store
             .db
             .execute(statement, Location::new("pending", offset))
             .with_context(|| format!("input byte {offset}"))?;
+        report.record_spill(spill);
         changes.extend(pending);
         for value in selected {
             crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;

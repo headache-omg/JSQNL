@@ -134,6 +134,9 @@ pub(crate) fn check(path: &Path, base: &File) -> Result<Option<&'static str>> {
     if before != seal.index || digest(&mut file)? != seal.sha256 || before != fingerprint(&file)? {
         return Ok(Some("invalid"));
     }
+    if seal.max_line_bytes.is_none() {
+        return Ok(Some("legacy"));
+    }
     Ok(Some("current"))
 }
 

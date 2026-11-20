@@ -1848,3 +1848,271 @@ fn import_can_use_full_scratch_budget_for_primary_keys() {
     assert_eq!(rows(import("12288")), [json!({"table":"t","rows":1})]);
     assert_eq!(db.exec("SELECT id FROM t;"), [json!({"id":1})]);
 }
+
+#[test]
+fn nested_signed_zero_matches_in_where_grouping_and_both_joins() {
+    let base = format!(
+        "-- SCHEMA: a (k JSON)\n{{\"k\":{{\"v\":[-0.0]}}}}\n{{\"k\":{{\"v\":[0.0]}}}}\n-- SCHEMA: b (k JSON)\n{{\"k\":{{\"v\":[0.0]}}}}\n-- {}\n",
+        "padding".repeat(200)
+    );
+    let db = Fixture::new(Some(&base));
+    assert_eq!(
+        db.exec("SELECT COUNT(*) FROM a WHERE k = {\"v\":[0.0]};"),
+        [json!({"count":2})]
+    );
+    assert_eq!(
+        db.exec("SELECT k, COUNT(*) FROM a GROUP BY k;"),
+        [json!({"k":{"v":[0.0]},"count":2})]
+    );
+    for budget in ["1024", "1048576"] {
+        let result = command_for("exec", &db.file("db.jsqnl"))
+            .arg("SELECT a._line FROM a JOIN b ON a.k = b.k;")
+            .env("JSQNL_JOIN_MEMORY_BYTES", budget)
+            .output()
+            .unwrap();
+        assert_eq!(rows(result), [json!({"a._line":1}), json!({"a._line":2})]);
+    }
+}
+
+#[test]
+fn float_arithmetic_and_fuse_do_not_depend_on_numeric_spelling() {
+    let db = Fixture::new(Some(
+        "-- SCHEMA: t (x FLOAT)\n{\"x\":9223372036854775807}\n{\"x\":9223372036854775807.0}\n{\"x\":1}\n{\"x\":1.0}\n",
+    ));
+    db.exec("INJECT x FROM t THE 1 WHO * 3; INJECT x FROM t THE 2 WHO * 3;");
+    let values = db.exec("SELECT x FROM t WHERE _line <= 2;");
+    assert_eq!(values[0], values[1]);
+    assert_eq!(values[0]["x"], json!(27670116110564327421_i128 as f64));
+    db.exec("FUSE t THE 3 INTO THE 4;");
+    assert_eq!(
+        db.exec("SELECT _line, x FROM t WHERE _line >= 3;"),
+        [json!({"_line":4,"x":1.0})]
+    );
+}
+
+#[test]
+fn materialized_plans_report_spills_and_stable_group_pagination() {
+    let mut base = String::from(
+        "-- SCHEMA: t (k INT PRIMARY KEY, pad TEXT)\n-- SCHEMA: a (k INT, pad TEXT)\n",
+    );
+    for k in (1..=64).rev() {
+        writeln!(base, "{}", json!({"k":k,"pad":"x".repeat(400)})).unwrap();
+    }
+    let db = Fixture::new(Some(&base));
+    db.exec("INSERT INTO t VALUES (1, 'logged');");
+    let query = "SELECT k, COUNT(*) FROM a GROUP BY k, pad LIMIT 3 OFFSET 2;";
+    let expected: Vec<_> = (60..=62).rev().map(|k| json!({"k":k,"count":1})).collect();
+    for limit in ["1024", "1048576"] {
+        let call = |sql: &str| {
+            rows(
+                command_for("exec", &db.file("db.jsqnl"))
+                    .arg(sql)
+                    .env("JSQNL_GROUP_MEMORY_BYTES", limit)
+                    .env("JSQNL_SORT_MEMORY_BYTES", limit)
+                    .output()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(call(query), expected);
+        if limit == "1024" {
+            let report =
+                call("EXPLAIN ANALYZE SELECT k, COUNT(*) FROM a GROUP BY k, pad;").remove(0);
+            assert_eq!(report["access"], "materialized");
+            assert!(
+                report["operators"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("external_hash_aggregation"))
+            );
+            assert!(report["spill_bytes_written"].as_u64().unwrap() > 0);
+        }
+    }
+    db.exec(&format!(
+        "SCHEMA b (pad TEXT);\n{}",
+        json!({"pad":"x".repeat(400)})
+    ));
+    let report = rows(
+        command_for("exec", &db.file("db.jsqnl"))
+            .arg("EXPLAIN ANALYZE SELECT a.k FROM a JOIN b ON a.pad = b.pad ORDER BY a.k;")
+            .env("JSQNL_SORT_MEMORY_BYTES", "1024")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report[0]["access"], "materialized");
+    assert!(
+        report[0]["operators"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("external_sort"))
+    );
+    assert!(report[0]["spill_bytes_written"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn run_checks_physical_records_and_schema_placement() {
+    let db = Fixture::new(None);
+    let script = db.file("script.jsqnl");
+    let run = |source: &str| {
+        fs::write(&script, source).unwrap();
+        command_for("run", &script)
+            .env("JSQNL_RECORD_LIMIT_BYTES", "1024")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        rows(run(
+            "\u{feff}SCHEMA t (k INT);\r\n{\"k\":7}\r\nSELECT k FROM t;"
+        )),
+        [json!({"k":7})]
+    );
+    let wide = run(&format!(
+        "SCHEMA t (k INT);\n{}{{\"k\":7}}\nSELECT k FROM t;",
+        " ".repeat(1024)
+    ));
+    assert!(!wide.status.success());
+    assert!(String::from_utf8_lossy(&wide.stderr).contains("record exceeds byte limit"));
+    for script in [
+        "SCHEMA t (k INT);\nSELECT k FROM t; SCHEMA u (k INT);",
+        "SCHEMA t (k INT); SELECT k FROM t;",
+    ] {
+        let result = run(script);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("SCHEMA must occupy its own line")
+        );
+    }
+}
+
+#[test]
+fn check_reports_an_unsupported_disk_index_as_legacy() {
+    let db = Fixture::new(Some(BASE));
+    assert!(db.call("disk-index", None).status.success());
+    assert_eq!(rows(db.call("check", None))[0]["disk_index"], "current");
+    let path = db.file("db.jsqnl.seek.sqlite.seal");
+    let mut seal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    seal.as_object_mut().unwrap().remove("max_line_bytes");
+    fs::write(path, serde_json::to_vec(&seal).unwrap()).unwrap();
+    assert_eq!(rows(db.call("check", None))[0]["disk_index"], "legacy");
+    let report = db.exec("EXPLAIN ANALYZE SELECT id FROM users WHERE id = 10;");
+    assert_eq!(report[0]["access"], "sequential_scan");
+}
+
+#[test]
+fn wide_sort_keys_count_towards_sort_budget() {
+    let columns: Vec<_> = (0..128).map(|i| format!("c{i}")).collect();
+    let definitions: Vec<_> = columns.iter().map(|name| format!("{name} INT")).collect();
+    let base = format!(
+        "-- SCHEMA: t ({})\n{}",
+        definitions.join(", "),
+        "{}\n".repeat(32)
+    );
+    let db = Fixture::new(Some(&base));
+    let query = format!(
+        "EXPLAIN ANALYZE SELECT _line FROM t ORDER BY {};",
+        columns.join(", ")
+    );
+    let report = rows(
+        command_for("exec", &db.file("db.jsqnl"))
+            .arg(query)
+            .env("JSQNL_SORT_MEMORY_BYTES", "16384")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        report[0]["operators"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("external_sort"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unusable_scratch_does_not_prevent_commands_that_need_no_scratch() {
+    use std::os::unix::fs::PermissionsExt;
+    let db = Fixture::new(Some(BASE));
+    let temp = db.file("temp");
+    fs::create_dir(&temp).unwrap();
+    let registry = registry_path(&temp);
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o755)).unwrap();
+    let version = Command::new(env!("CARGO_BIN_EXE_jsqnl"))
+        .arg("--version")
+        .env("TMPDIR", &temp)
+        .output()
+        .unwrap();
+    assert!(version.status.success(), "{version:?}");
+    let check = command_for("check", &db.file("db.jsqnl"))
+        .env("TMPDIR", &temp)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+    let read = command_for("exec", &db.file("db.jsqnl"))
+        .arg("SELECT id FROM users ORDER BY id;")
+        .env("TMPDIR", &temp)
+        .env("JSQNL_SORT_MEMORY_BYTES", "1024")
+        .output()
+        .unwrap();
+    assert_eq!(rows(read), [json!({"id":10}), json!({"id":20})]);
+    let spill = command_for("exec", &db.file("db.jsqnl"))
+        .arg("SELECT * FROM users ORDER BY name, tags, v;")
+        .env("TMPDIR", &temp)
+        .env("JSQNL_SORT_MEMORY_BYTES", "1024")
+        .output()
+        .unwrap();
+    assert!(!spill.status.success());
+    assert!(String::from_utf8_lossy(&spill.stderr).contains("mode 0700"));
+}
+
+#[test]
+#[ignore = "requires a Python with PyArrow; set JSQNL_PYTHON"]
+fn parquet_projection_timestamp_and_utf8_protocol() {
+    let db = Fixture::new(None);
+    let path = db.file("my-data");
+    fs::create_dir(&path).unwrap();
+    let python = std::env::var_os("JSQNL_PYTHON").unwrap_or_else(|| "python3".into());
+    let setup = Command::new(python)
+        .arg("-c")
+        .arg(concat!(
+            "import sys, pyarrow as pa, pyarrow.parquet as pq\n",
+            "stamp = pa.array([1700000000123456789], type=pa.timestamp('ns', 'UTC'))\n",
+            "nested = pa.StructArray.from_arrays([stamp], names=['ts'])\n",
+            "pq.write_table(pa.table({'a':[{'b':b'bytes'}], 'a.b':[42], 'ts':stamp, 'nested':nested, 'title':['雪']}), sys.argv[1])\n",
+        ))
+        .arg(path.join("one.parquet"))
+        .output().unwrap();
+    assert!(setup.status.success(), "{setup:?}");
+    for encoding in ["ascii", "utf-16"] {
+        let result = command_for("scan", &path)
+            .arg("SELECT a.b, ts, nested, title FROM \"my-data\" WHERE a.b = 42;")
+            .env("PYTHONIOENCODING", encoding)
+            .output()
+            .unwrap();
+        let stamp = "2023-11-14T22:13:20.123456789+00:00";
+        assert_eq!(
+            rows(result),
+            [json!({"a.b":42,"ts":stamp,"nested":{"ts":stamp},"title":"雪"})]
+        );
+    }
+}
+
+#[test]
+fn bulk_update_budget_failure_leaves_the_database_unchanged() {
+    let base = format!("-- SCHEMA: t (x TEXT)\n{}", "{}\n".repeat(96));
+    let db = Fixture::new(Some(&base));
+    let sql = format!("UPDATE t SET x = '{}';", "x".repeat(32 * 1024));
+    let output = command_for("exec", &db.file("db.jsqnl"))
+        .arg(sql)
+        .env("JSQNL_MATERIALIZED_LIMIT_BYTES", "65536")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("materialization memory budget exceeded")
+    );
+    assert!(!db.file("db.jsqnl.log").exists());
+    assert_eq!(
+        db.exec("SELECT COUNT(*) FROM t WHERE x IS NULL;"),
+        [json!({"count":96})]
+    );
+}

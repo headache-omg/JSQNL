@@ -296,19 +296,32 @@ pub fn parse(source: &str) -> Result<Vec<(u64, Statement)>> {
             .statement()
             .map_err(|e| anyhow!("line {line}, byte {offset}: {e}"))?;
         if matches!(statement, Statement::Row(_) | Statement::Schema(..)) {
+            let line_prefix = source[..offset].rsplit('\n').next().unwrap();
+            let line_suffix = source[offset..].split_inclusive('\n').next().unwrap();
+            let record_limit = crate::limits::record()?;
+            ensure!(
+                (line_prefix.len() + line_suffix.len()) as u64 <= record_limit,
+                "line {line}: record exceeds byte limit ({record_limit})"
+            );
+            let prefix = if line == 1 {
+                line_prefix.strip_prefix('\u{feff}').unwrap_or(line_prefix)
+            } else {
+                line_prefix
+            };
             if matches!(statement, Statement::Row(_)) {
-                let end = source[offset..].split('\n').next().unwrap();
-                let prefix = source[..offset]
-                    .rsplit('\n')
-                    .next()
-                    .unwrap()
-                    .trim_start_matches('\u{feff}');
                 ensure!(
                     prefix.trim().is_empty()
-                        && serde_json::from_str::<crate::import_json::BoundedValue>(end).is_ok(),
+                        && serde_json::from_str::<crate::import_json::BoundedValue>(
+                            line_suffix.trim_end_matches('\n')
+                        )
+                        .is_ok(),
                     "line {line}: JSONL requires one object per physical line"
                 );
             } else {
+                ensure!(
+                    prefix.trim().is_empty(),
+                    "line {line}: SCHEMA must occupy its own line"
+                );
                 let last = parser.tokens[parser.pos - 1].offset;
                 ensure!(
                     !source[offset..last].contains('\n'),
@@ -781,7 +794,13 @@ impl Parser {
                 (!columns.is_empty()).then_some(columns)
             };
             self.expect_word("FROM")?;
-            let table = self.name()?;
+            let table = if let Some(Token::Value(Value::String(name))) = self.peek() {
+                let name = name.clone();
+                self.pos += 1;
+                name
+            } else {
+                self.name()?
+            };
             options.alias = self.table_alias()?;
             let left = self.word("LEFT");
             if left {

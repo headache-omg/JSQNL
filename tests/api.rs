@@ -193,3 +193,36 @@ fn query_callback_can_reenter_the_same_database() {
     assert_eq!(stored, [json!({"n":1}), json!({"n":20})]);
     worker.join().unwrap();
 }
+
+#[test]
+fn format_readers_agree_on_schema_comments_line_endings_and_finite_numbers() {
+    let dir = Temp::new();
+    let path = dir.0.join("db.jsqnl");
+    for (contents, valid) in [
+        (
+            "-- SCHEMA: t (x INT) -- note (units)\r\n{\"x\":1}\r\n".to_owned(),
+            true,
+        ),
+        ("-- SCHEMA: t (x INT)\r{\"x\":1}\r".to_owned(), false),
+        (
+            format!("-- SCHEMA: t (x FLOAT)\n{{\"x\":1{}}}\n", "0".repeat(309)),
+            false,
+        ),
+    ] {
+        fs::write(&path, contents).unwrap();
+        let mut rows = Vec::new();
+        let rust = execute(&path, "SELECT x FROM t;", |row| {
+            rows.push(row);
+            Ok(())
+        });
+        let python = reference(&path, "t");
+        assert_eq!(rust.is_ok(), valid, "{rust:?}");
+        assert_eq!(python.status.success(), valid, "{python:?}");
+        if valid {
+            assert_eq!(
+                serde_json::from_slice::<Vec<Value>>(&python.stdout).unwrap(),
+                rows
+            );
+        }
+    }
+}

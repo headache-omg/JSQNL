@@ -109,7 +109,7 @@ pub fn run_script(source: &str) -> Result<Vec<Value>> {
     let mut bytes = 0;
     let mut output = Vec::new();
     for (offset, statement) in parse(source)? {
-        let (_, rows) = db
+        let (_, rows, _) = db
             .execute(statement, Location::new("script", offset))
             .with_context(|| format!("script byte {offset}"))?;
         for row in rows {

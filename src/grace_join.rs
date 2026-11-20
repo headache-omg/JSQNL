@@ -65,6 +65,9 @@ pub(crate) fn hash_key(value: Value) -> Option<String> {
             }
             Some(format!("f:{:016x}", number.as_f64()?.to_bits()))
         }
+        value @ (Value::Array(_) | Value::Object(_)) => {
+            Some(format!("j:{}", crate::engine::nested_json_key(&value)))
+        }
         value => Some(format!("j:{value}")),
     }
 }

@@ -2,7 +2,7 @@ use crate::aggregate::Aggregation;
 use crate::scratch::{Scratch, ScratchSlot};
 use crate::sort::Sorter;
 use crate::syntax::{Column, InsertData, Kind, Op, Predicate, SelectOptions, Statement};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::borrow::Borrow;
@@ -499,7 +499,7 @@ impl<'a> SelectRows<'a> {
             options.group.clear();
             options.count = None;
             let mut results =
-                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone(), false)?;
+                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone(), true)?;
             let written = groups.finish(|id, count, values| {
                 let mut row: Row = self.options.group.iter().cloned().zip(values).collect();
                 if let Some(name) = &self.options.count {
@@ -560,6 +560,29 @@ pub(crate) fn order_row(
     left.0.cmp(&right.0)
 }
 
+// serde_json compares the two floating-point zeros as equal, even inside
+// arrays and objects. Preserve all other nested numeric representations.
+pub(crate) fn nested_json_key(value: &Value) -> String {
+    fn normalize(value: &mut Value) {
+        match value {
+            Value::Number(n) if n.is_f64() && n.as_f64() == Some(0.0) => {
+                *value = Value::from(0.0);
+            }
+            Value::Array(values) => values.iter_mut().for_each(normalize),
+            Value::Object(values) => values.values_mut().for_each(normalize),
+            _ => {}
+        }
+    }
+
+    let mut value = value.clone();
+    normalize(&mut value);
+    value.to_string()
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    a == b || compare(a, b).is_some_and(Ordering::is_eq)
+}
+
 fn order_value(a: &Value, b: &Value) -> Ordering {
     fn rank(value: &Value) -> u8 {
         match value {
@@ -575,7 +598,7 @@ fn order_value(a: &Value, b: &Value) -> Ordering {
         compare(a, b).unwrap_or_else(|| match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            _ => a.to_string().cmp(&b.to_string()),
+            _ => nested_json_key(a).cmp(&nested_json_key(b)),
         })
     })
 }
@@ -670,11 +693,19 @@ fn inject(old: Value, op: Op, value: Value, kind: &Kind) -> Result<Value> {
             _ => unreachable!(),
         };
         if !matches!(op, Op::Div) || result.is_some() {
-            let result = result.ok_or_else(|| anyhow!("integer overflow"))?;
-            return i64::try_from(result)
-                .map(Value::from)
-                .or_else(|_| u64::try_from(result).map(Value::from))
-                .context("integer overflow");
+            if let Some(result) = result {
+                if let Ok(number) = i64::try_from(result) {
+                    return Ok(Value::from(number));
+                }
+                if let Ok(number) = u64::try_from(result) {
+                    return Ok(Value::from(number));
+                }
+            }
+            ensure!(!matches!(kind, Kind::Int | Kind::Json), "integer overflow");
+            // FLOAT can represent finite results outside the integer range.
+            if let Some(result) = result {
+                return Ok(Value::from(result as f64));
+            }
         }
     }
     let a = old
@@ -1058,8 +1089,9 @@ impl Database {
         &mut self,
         statement: Statement,
         location: Location,
-    ) -> Result<(Vec<Change>, Vec<Value>)> {
+    ) -> Result<(Vec<Change>, Vec<Value>, ResultSpill)> {
         let mut output = Vec::new();
+        let mut spill = ResultSpill::default();
         let changes = match statement {
             Statement::ExplainAnalyze(_) => bail!("EXPLAIN ANALYZE requires a database query"),
             Statement::Schema(table, columns) => vec![Change::Schema { table, columns }],
@@ -1135,7 +1167,7 @@ impl Database {
                             row.insert(column.name.clone(), value.clone());
                         }
                         Some(existing) => ensure!(
-                            keep_target || existing == value,
+                            keep_target || values_equal(existing, value),
                             "FUSE conflict in column {}",
                             column.name
                         ),
@@ -1250,7 +1282,7 @@ impl Database {
                 if let Some(join) = &options.join {
                     let left = self.table(&table)?;
                     let right = self.table(&join.table)?;
-                    self.join_rows(
+                    spill = self.join_rows(
                         &table,
                         columns.as_deref(),
                         predicate.as_ref(),
@@ -1268,7 +1300,7 @@ impl Database {
                             Ok(())
                         },
                     )?;
-                    return Ok((Vec::new(), output));
+                    return Ok((Vec::new(), output, spill));
                 }
                 self.validate_select(&table, columns.as_deref(), predicate.as_ref())?;
                 self.validate_group_order(&table, &options)?;
@@ -1281,7 +1313,7 @@ impl Database {
                         output.push(value);
                     }
                 }
-                results.finish_with(&mut |value| {
+                spill = results.finish_with(&mut |value| {
                     crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;
                     output.push(value);
                     Ok(())
@@ -1295,19 +1327,20 @@ impl Database {
                     ensure!(state.has_column(name), "unknown column {name}");
                     ensure!(seen.insert(name), "duplicate assignment {name}");
                 }
-                state
-                    .matching(predicate.as_ref())?
-                    .into_iter()
-                    .map(|id| {
-                        let mut row = state.rows[&id].0.clone();
-                        row.extend(assignments.iter().cloned());
-                        Change::Update {
-                            table: table.clone(),
-                            id,
-                            row,
-                        }
-                    })
-                    .collect()
+                let ids = state.matching(predicate.as_ref())?;
+                let mut changes = Vec::new();
+                for id in ids {
+                    let mut row = self.table(&table)?.rows[&id].0.clone();
+                    row.extend(assignments.iter().cloned());
+                    let change = Change::Update {
+                        table: table.clone(),
+                        id,
+                        row,
+                    };
+                    self.apply(&change, location)?;
+                    changes.push(change);
+                }
+                return Ok((changes, output, spill));
             }
             Statement::Delete(table, predicate) => self
                 .table(&table)?
@@ -1338,6 +1371,6 @@ impl Database {
         for change in &changes {
             self.apply(change, location)?;
         }
-        Ok((changes, output))
+        Ok((changes, output, spill))
     }
 }

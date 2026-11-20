@@ -73,11 +73,12 @@ impl<'a> Sorter<'a> {
     }
 
     fn weight(row: &OrderedRow) -> u64 {
-        128 + row
-            .1
-            .iter()
-            .map(crate::aggregate::value_weight)
-            .sum::<u64>()
+        128 + (row.1.capacity() * std::mem::size_of::<Value>()) as u64
+            + row
+                .1
+                .iter()
+                .map(crate::aggregate::value_weight)
+                .sum::<u64>()
             + crate::aggregate::value_weight(&row.2)
     }
 

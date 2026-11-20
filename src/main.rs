@@ -88,7 +88,9 @@ fn cli() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = jsqnl::recover_temporary_files().and_then(|_| cli()) {
+    // Scratch creation retries recovery when a command actually needs it.
+    let _ = jsqnl::recover_temporary_files();
+    if let Err(error) = cli() {
         eprintln!("jsqnl: {}", jsqnl::terminal_diagnostic(&error));
         std::process::exit(1);
     }

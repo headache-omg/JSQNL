@@ -140,6 +140,7 @@ impl QueryReport {
                 operators.push("count");
             }
             if !options.order.is_empty()
+                || !options.group.is_empty()
                 || (access == AccessPath::GraceHashJoin
                     && options.group.is_empty()
                     && options.count.is_none())
