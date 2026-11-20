@@ -717,7 +717,7 @@ fn validate_base(
     let scratch = (base.metadata()?.len() > crate::aggregate::DEFAULT_BUDGET)
         .then(Scratch::new)
         .transpose()?;
-    let mut keys = scratch.as_ref().map(KeyValidation::new);
+    let mut keys = scratch.as_ref().map(KeyValidation::exclusive);
     let (db, _, _) = walk_base(
         path,
         base,

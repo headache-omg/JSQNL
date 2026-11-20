@@ -255,6 +255,7 @@ pub(crate) fn execute(
         predicate,
         options,
         Some(Rc::clone(&scratch)),
+        true,
         |left_key, right_key, visit| {
             for (i, (left, right)) in left.iter().zip(&right).enumerate() {
                 let left_path = name("left", i);

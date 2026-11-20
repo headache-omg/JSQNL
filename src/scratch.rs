@@ -209,7 +209,14 @@ impl Scratch {
     }
 
     pub(crate) fn reserve_sqlite(&self, name: &str) -> Result<(Connection, u64)> {
-        let reservation = (self.limit - self.used.get()) / 2;
+        self.reserve_sqlite_with_budget(name, (self.limit - self.used.get()) / 2)
+    }
+
+    fn reserve_sqlite_with_budget(
+        &self,
+        name: &str,
+        reservation: u64,
+    ) -> Result<(Connection, u64)> {
         let connection = self.open_sqlite(name, reservation)?;
         self.account(reservation)?;
         Ok((connection, reservation))
@@ -241,6 +248,7 @@ pub(crate) struct KeyValidation<'a> {
     scratch: &'a Scratch,
     database: Option<Connection>,
     reserved: u64,
+    exclusive: bool,
 }
 
 impl<'a> KeyValidation<'a> {
@@ -249,12 +257,27 @@ impl<'a> KeyValidation<'a> {
             scratch,
             database: None,
             reserved: 0,
+            exclusive: false,
+        }
+    }
+
+    /// Use when key validation is the only consumer of this scratch directory.
+    pub(crate) fn exclusive(scratch: &'a Scratch) -> Self {
+        Self {
+            exclusive: true,
+            ..Self::new(scratch)
         }
     }
 
     pub(crate) fn insert(&mut self, relation: &str, id: u64, key: &str) -> Result<()> {
         if self.database.is_none() {
-            let (db, reserved) = self.scratch.reserve_sqlite("keys.sqlite")?;
+            let (db, reserved) = if self.exclusive {
+                let remaining = self.scratch.limit - self.scratch.used.get();
+                self.scratch
+                    .reserve_sqlite_with_budget("keys.sqlite", remaining)?
+            } else {
+                self.scratch.reserve_sqlite("keys.sqlite")?
+            };
             db.execute_batch("CREATE TABLE keys (name TEXT, key TEXT, PRIMARY KEY (name, key)) WITHOUT ROWID; BEGIN;")?;
             self.database = Some(db);
             self.reserved = reserved;

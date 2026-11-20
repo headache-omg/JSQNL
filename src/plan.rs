@@ -139,7 +139,11 @@ impl QueryReport {
             if options.count.is_some() {
                 operators.push("count");
             }
-            if !options.order.is_empty() {
+            if !options.order.is_empty()
+                || (access == AccessPath::GraceHashJoin
+                    && options.group.is_empty()
+                    && options.count.is_none())
+            {
                 operators.push("sort");
             }
             if options.limit.is_some() || options.offset != 0 {

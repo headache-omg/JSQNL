@@ -406,13 +406,14 @@ impl<'a> SelectRows<'a> {
         options: &'a SelectOptions,
         scratch: Option<Rc<Scratch>>,
     ) -> Result<Self> {
-        Self::with_slot(columns, options, ScratchSlot::new(scratch))
+        Self::with_slot(columns, options, ScratchSlot::new(scratch), false)
     }
 
     fn with_slot(
         columns: Option<&'a [String]>,
         options: &'a SelectOptions,
         scratch: ScratchSlot,
+        restore_source_order: bool,
     ) -> Result<Self> {
         let keep = options.limit.and_then(|limit| {
             if limit == 0 {
@@ -425,7 +426,9 @@ impl<'a> SelectRows<'a> {
             columns,
             options,
             matched: 0,
-            ordered: (options.group.is_empty() && !options.order.is_empty())
+            ordered: (options.group.is_empty()
+                && options.count.is_none()
+                && (!options.order.is_empty() || restore_source_order))
                 .then(|| Sorter::new(&options.order, keep, scratch.clone()))
                 .transpose()?,
             groups: (!options.group.is_empty())
@@ -496,7 +499,7 @@ impl<'a> SelectRows<'a> {
             options.group.clear();
             options.count = None;
             let mut results =
-                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone())?;
+                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone(), false)?;
             let written = groups.finish(|id, count, values| {
                 let mut row: Row = self.options.group.iter().cloned().zip(values).collect();
                 if let Some(name) = &self.options.count {
@@ -895,6 +898,7 @@ impl Database {
             predicate,
             options,
             None,
+            false,
             |left_key, right_key, visit| {
                 let join = options.join.as_ref().expect("JOIN options are present");
                 let mut index: BTreeMap<SqlKey, Vec<_>> = BTreeMap::new();
@@ -927,6 +931,7 @@ impl Database {
         predicate: Option<&Predicate>,
         options: &SelectOptions,
         scratch: Option<Rc<Scratch>>,
+        restore_source_order: bool,
         pairs: impl FnOnce(&str, &str, &mut JoinVisitor<'_>) -> Result<()>,
         mut emit: impl FnMut(Value) -> Result<()>,
     ) -> Result<ResultSpill> {
@@ -1018,7 +1023,12 @@ impl Database {
         }
         let projection =
             columns.or_else(|| options.count.is_none().then_some(qualified.as_slice()));
-        let mut results = SelectRows::with_scratch(projection, options, scratch)?;
+        let mut results = SelectRows::with_slot(
+            projection,
+            options,
+            ScratchSlot::new(scratch),
+            restore_source_order,
+        )?;
         let mut sequence = 0;
         pairs(left_key, right_key, &mut |left_id, left_row, hit| {
             sequence += 1;

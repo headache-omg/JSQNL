@@ -57,6 +57,7 @@ struct Seal {
     base: String,
     index: String,
     sha256: String,
+    max_line_bytes: Option<u64>,
 }
 
 fn load_seal(index: &Path) -> Result<Option<Seal>> {
@@ -74,12 +75,19 @@ fn load_seal(index: &Path) -> Result<Option<Seal>> {
     Ok(serde_json::from_slice::<Seal>(&bytes).ok())
 }
 
-fn write_seal(index: &Path, base: String, sha256: String, stage: &Path) -> Result<()> {
+fn write_seal(
+    index: &Path,
+    base: String,
+    sha256: String,
+    max_line_bytes: u64,
+    stage: &Path,
+) -> Result<()> {
     let file = open_regular(index)?;
     let seal = Seal {
         base,
         index: fingerprint(&file)?,
         sha256,
+        max_line_bytes: Some(max_line_bytes),
     };
     let mut writer = private_options().create_new(true).open(stage)?;
     serde_json::to_writer(&mut writer, &seal)?;
@@ -153,6 +161,7 @@ pub fn build(path: &Path) -> Result<()> {
              ) WITHOUT ROWID;",
         )?;
         let transaction = sqlite.transaction()?;
+        let mut max_line_bytes = 0;
         {
             let mut schema = transaction.prepare("INSERT INTO schemas VALUES (?, ?)")?;
             let mut row = transaction.prepare("INSERT INTO offsets VALUES (?, ?, ?, ?)")?;
@@ -160,7 +169,7 @@ pub fn build(path: &Path) -> Result<()> {
                 &path,
                 &base,
                 BaseRead::BuildIndex,
-                |_| {},
+                |line| max_line_bytes = max_line_bytes.max(line.len() as u64),
                 |_, name, columns| {
                     schema.execute(params![name, serde_json::to_string(columns)?])?;
                     Ok(())
@@ -190,7 +199,7 @@ pub fn build(path: &Path) -> Result<()> {
         let sha256 = digest(&mut file)?;
         drop(file);
         std::fs::rename(&stage, &index)?;
-        write_seal(&index, signature, sha256, &seal_stage)?;
+        write_seal(&index, signature, sha256, max_line_bytes, &seal_stage)?;
         Ok(())
     })();
     if result.is_err() {
@@ -229,6 +238,11 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
     let Some(seal) = load_seal(&index)? else {
         return Ok(None);
     };
+    let limit = crate::limits::record()?;
+    // A seal built without line sizes cannot establish validity under this limit.
+    if seal.max_line_bytes.is_none_or(|size| size > limit) {
+        return Ok(None);
+    }
     let file = open_regular(&index)?;
     if seal.base != fingerprint(base)? || seal.index != fingerprint(&file)? {
         return Ok(None);

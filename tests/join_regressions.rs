@@ -175,3 +175,19 @@ fn explain_join_reports_external_aggregation() {
         "group",
     );
 }
+
+#[test]
+fn grace_join_without_order_by_paginates_in_source_order() {
+    let db = Fixture::new();
+    let query = "SELECT a._line, b._line FROM a LEFT JOIN b ON a.k = b.k LIMIT 4 OFFSET 2;";
+    let expected = vec![
+        json!({"a._line":2,"b._line":94}),
+        json!({"a._line":3,"b._line":91}),
+        json!({"a._line":3,"b._line":92}),
+        json!({"a._line":4,"b._line":89}),
+    ];
+    assert_eq!(db.query(query, "1048576", "1024"), expected);
+    for _ in 0..3 {
+        assert_eq!(db.query(query, "1024", "1024"), expected);
+    }
+}

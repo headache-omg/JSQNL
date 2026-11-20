@@ -1787,3 +1787,64 @@ fn legacy_authentication_is_explicit_read_only_and_fork_upgrades_it() {
         [json!({"n":7})]
     );
 }
+
+#[test]
+fn disk_index_respects_current_physical_line_limit() {
+    let base = format!(
+        "-- SCHEMA: t (id INT PRIMARY KEY)\n{}{{\"id\":1}}\n",
+        " ".repeat(1024)
+    );
+    let db = Fixture::new(Some(&base));
+    let path = db.file("db.jsqnl");
+    let build = command_for("disk-index", &path)
+        .env("JSQNL_RECORD_LIMIT_BYTES", "4096")
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{build:?}");
+    for (query, access) in [
+        ("SELECT id FROM t WHERE id = 1;", "index_seek"),
+        ("SELECT COUNT(*) FROM t;", "index_count"),
+    ] {
+        let execute = |limit, sql: &str| {
+            command_for("exec", &path)
+                .env("JSQNL_RECORD_LIMIT_BYTES", limit)
+                .arg(sql)
+                .output()
+                .unwrap()
+        };
+        let report = rows(execute("4096", &format!("EXPLAIN ANALYZE {query}")));
+        assert_eq!(report[0]["access"], access);
+        let error = execute("1024", query);
+        assert!(!error.status.success(), "{error:?}");
+        assert!(String::from_utf8_lossy(&error.stderr).contains("record exceeds byte limit"));
+    }
+}
+
+#[test]
+fn import_can_use_full_scratch_budget_for_primary_keys() {
+    let db = Fixture::new(None);
+    let schema = db.file("input.sql");
+    let input = db.file("input.jsonl");
+    let output = db.file("db.jsqnl");
+    let temp = db.file("temp");
+    fs::create_dir(&temp).unwrap();
+    fs::write(&schema, "CREATE TABLE t (id INT PRIMARY KEY);").unwrap();
+    fs::write(&input, "{\"id\":1}\n").unwrap();
+    let import = |limit| {
+        Command::new(env!("CARGO_BIN_EXE_in2jsqnl"))
+            .arg("--schema")
+            .arg(&schema)
+            .arg("--input")
+            .arg(&input)
+            .arg("--output")
+            .arg(&output)
+            .env("TMPDIR", &temp)
+            .env("JSQNL_TEMP_LIMIT_BYTES", limit)
+            .output()
+            .unwrap()
+    };
+    assert!(!import("4096").status.success());
+    assert!(!output.exists());
+    assert_eq!(rows(import("12288")), [json!({"table":"t","rows":1})]);
+    assert_eq!(db.exec("SELECT id FROM t;"), [json!({"id":1})]);
+}

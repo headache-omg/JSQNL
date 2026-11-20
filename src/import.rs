@@ -171,7 +171,7 @@ pub fn import(
         .any(|column| column.primary)
         .then(Scratch::new)
         .transpose()?;
-    let mut keys = scratch.as_ref().map(KeyValidation::new);
+    let mut keys = scratch.as_ref().map(KeyValidation::exclusive);
     let mut row_number = 0;
     let mut write_row = |row: Row| -> Result<()> {
         row_number += 1;
