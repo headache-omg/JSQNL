@@ -58,6 +58,7 @@ struct Seal {
     index: String,
     sha256: String,
     max_line_bytes: Option<u64>,
+    validation_version: Option<u32>,
 }
 
 fn load_seal(index: &Path) -> Result<Option<Seal>> {
@@ -88,6 +89,7 @@ fn write_seal(
         index: fingerprint(&file)?,
         sha256,
         max_line_bytes: Some(max_line_bytes),
+        validation_version: Some(2),
     };
     let mut writer = private_options().create_new(true).open(stage)?;
     serde_json::to_writer(&mut writer, &seal)?;
@@ -116,14 +118,14 @@ fn unexpected_sidecar(index: &Path) -> Result<Option<std::path::PathBuf>> {
 /// filesystem fingerprints, so index seek does not read or hash the SQLite file.
 pub(crate) fn check(path: &Path, base: &File) -> Result<Option<&'static str>> {
     let index = sidecar(path, ".seek.sqlite");
+    if unexpected_sidecar(&index)?.is_some() {
+        return Ok(Some("invalid"));
+    }
     let mut file = match open_regular(&index) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("opening disk index"),
     };
-    if unexpected_sidecar(&index)?.is_some() {
-        return Ok(Some("invalid"));
-    }
     let Some(seal) = load_seal(&index)? else {
         return Ok(Some("unsealed"));
     };
@@ -134,7 +136,7 @@ pub(crate) fn check(path: &Path, base: &File) -> Result<Option<&'static str>> {
     if before != seal.index || digest(&mut file)? != seal.sha256 || before != fingerprint(&file)? {
         return Ok(Some("invalid"));
     }
-    if seal.max_line_bytes.is_none() {
+    if seal.validation_version != Some(2) || seal.max_line_bytes.is_none() {
         return Ok(Some("legacy"));
     }
     Ok(Some("current"))
@@ -148,6 +150,9 @@ pub fn build(path: &Path) -> Result<()> {
     );
     let signature = fingerprint(&base)?;
     let index = sidecar(&path, ".seek.sqlite");
+    if let Some(auxiliary) = unexpected_sidecar(&index)? {
+        anyhow::bail!("unexpected disk index sidecar: {}", auxiliary.display());
+    }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let stage = sidecar(&index, &format!(".{nonce}.tmp"));
     let seal_stage = sidecar(&stage, ".seal");
@@ -243,7 +248,7 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
     };
     let limit = crate::limits::record()?;
     // A seal built without line sizes cannot establish validity under this limit.
-    if seal.max_line_bytes.is_none_or(|size| size > limit) {
+    if seal.validation_version != Some(2) || seal.max_line_bytes.is_none_or(|size| size > limit) {
         return Ok(None);
     }
     let file = open_regular(&index)?;

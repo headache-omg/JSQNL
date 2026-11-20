@@ -32,24 +32,25 @@ pub fn scan(
         options.join.is_none(),
         "JOIN requires tables in one .jsqnl database"
     );
-    let directory = directory
+    fn table_name(path: &Path) -> Option<&str> {
+        let table = if path.file_name()? == "data" {
+            path.parent()?
+        } else {
+            path
+        };
+        table.file_name()?.to_str()
+    }
+    let requested = std::path::absolute(directory)?;
+    let directory = requested
         .canonicalize()
         .context("opening Parquet directory")?;
     ensure!(directory.is_dir(), "scan requires a Parquet directory");
-    let table_directory = if directory.file_name().is_some_and(|name| name == "data") {
-        directory
-            .parent()
-            .context("Parquet data directory has no parent")?
-    } else {
-        directory.as_path()
-    };
-    let expected_table = table_directory
-        .file_name()
-        .and_then(|name| name.to_str())
+    let expected = table_name(&requested)
+        .or_else(|| table_name(&directory))
         .context("cannot derive a table name from the directory")?;
     ensure!(
-        table == expected_table,
-        "unknown table {table}; this directory provides {expected_table}"
+        table == expected || table_name(&directory) == Some(table.as_str()),
+        "unknown table {table}; this directory provides {expected}"
     );
 
     let mut required = BTreeSet::new();
@@ -70,8 +71,7 @@ pub fn scan(
         .arg("-c")
         .arg(include_str!("parquet_reader.py"))
         .arg(directory)
-        .arg(serde_json::to_string(&required)?)
-        .arg(serde_json::to_string(&projection)?)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .context(
@@ -79,6 +79,12 @@ pub fn scan(
         )?;
     let stdout = reader.stdout.take().expect("reader stdout is piped");
     let result = (|| -> Result<()> {
+        {
+            let mut request =
+                std::io::BufWriter::new(reader.stdin.take().context("missing reader stdin")?);
+            serde_json::to_writer(&mut request, &(&required, projection))?;
+            std::io::Write::flush(&mut request)?;
+        }
         let mut input = BufReader::new(stdout);
         let mut line = String::new();
         let mut id = 0;

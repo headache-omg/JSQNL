@@ -15,6 +15,11 @@ pub(crate) fn materialized() -> Result<u64> {
     crate::scratch::configured_bytes("JSQNL_MATERIALIZED_LIMIT_BYTES", 128 * MIB)
 }
 
+pub(crate) fn valid_line_ending(line: &str) -> bool {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    !body.strip_suffix('\r').unwrap_or(body).contains('\r')
+}
+
 pub(crate) fn line(reader: &mut impl BufRead, output: &mut String, limit: u64) -> Result<usize> {
     let count = reader.take(limit.saturating_add(1)).read_line(output)?;
     ensure!(count as u64 <= limit, "record exceeds byte limit ({limit})");

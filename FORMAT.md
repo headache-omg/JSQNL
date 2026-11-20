@@ -6,7 +6,7 @@ This specification defines the base file exchanged between JSQNL implementations
 
 - Files use UTF-8. A UTF-8 BOM is permitted at byte zero.
 - The optional header `-- JSQNL: 1` belongs on the first physical line. An absent header denotes version 1. Readers must reject unsupported versions and misplaced version headers.
-- Writers should emit LF. Readers accept LF, CRLF, and a final line without a terminator.
+- Writers should emit LF. Readers accept LF, CRLF, and a final line without a terminator. An embedded raw CR inside a record is invalid.
 - A physical line contains a schema, a JSON object, an ordinary `--` comment, or whitespace. A JSON data line cannot have a trailing comment.
 
 ## Schema and rows
@@ -29,7 +29,7 @@ Each data object belongs to the most recent schema. A table has one contiguous s
 | `TEXT` or `STRING` | JSON string. |
 | `BOOL` or `BOOLEAN` | JSON `true` or `false`. |
 | `JSON` | Any supported JSON value, including objects and arrays. |
-| `VECTOR(n)` | Array of exactly `n` finite JSON numbers, where `n` is a positive integer. |
+| `VECTOR(n)` | Array of exactly `n` finite JSON numbers, where `n` is a positive integer written without leading zeros and representable as a platform array length. |
 
 JSON strings and member names use double quotes and JSON escapes. Use `\n` for a newline, `\t` for a tab, `\"` for a quotation mark and `\\` for a backslash. Unicode can be literal UTF-8 or a JSON Unicode escape. Surrogate escapes must form valid pairs. Writers must emit finite numbers. For exact integer interchange, use signed 64-bit values. Larger integers in JSON or FLOAT fields can be rounded by readers.
 

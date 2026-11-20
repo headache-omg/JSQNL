@@ -20,27 +20,71 @@ def json_default(value):
     raise TypeError(f"Unsupported Parquet value: {type(value).__name__}")
 
 
-def contains_nanosecond_timestamp(kind):
+def needs_scalar_conversion(kind):
+    if pa.types.is_time(kind):
+        return True
     if pa.types.is_timestamp(kind):
         return kind.unit == "ns"
     if pa.types.is_dictionary(kind):
-        return contains_nanosecond_timestamp(kind.value_type)
-    return any(contains_nanosecond_timestamp(kind.field(i).type)
+        return needs_scalar_conversion(kind.value_type)
+    return any(needs_scalar_conversion(kind.field(i).type)
                for i in range(kind.num_fields))
+
+
+TICKS = {"s": 1, "ms": 1000, "us": 10**6, "ns": 10**9}
+
+
+def date_text(days):
+    # Gregorian dates repeat every 400 years. Keep the conversion inside
+    # datetime.date's supported range even for extended ISO years.
+    cycles, remainder = divmod(days, 146097)
+    date = datetime.date(1970, 1, 1) + datetime.timedelta(days=remainder)
+    year = date.year + cycles * 400
+    year_text = f"{year:04d}" if 0 <= year <= 9999 else f"{year:+07d}"
+    return f"{year_text}-{date.month:02d}-{date.day:02d}"
+
+
+def clock_text(seconds):
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def temporal_text(scalar):
+    kind = scalar.type
+    if pa.types.is_date32(kind):
+        return date_text(scalar.cast(pa.int32()).as_py())
+    if pa.types.is_date64(kind):
+        return date_text(scalar.cast(pa.int64()).as_py() // 86400000)
+    ticks = TICKS[kind.unit]
+    seconds, fraction = divmod(scalar.value, ticks)
+    suffix = ""
+    if pa.types.is_timestamp(kind) and kind.tz:
+        # Compute the offset at this exact UTC second. Historical offsets
+        # can include seconds, which strftime("%z") truncates.
+        utc = pa.scalar(seconds, type=pa.timestamp("s", kind.tz))
+        local = pc.local_timestamp(utc).cast(pa.int64()).as_py()
+        delta = local - seconds
+        offset = clock_text(abs(delta))
+        suffix = ("+" if delta >= 0 else "-") + (offset if delta % 60 else offset[:-3])
+        seconds = local
+    days, daytime = divmod(seconds, 86400)
+    text = clock_text(daytime)
+    if kind.unit == "ns":
+        text += f".{fraction:09d}"
+    elif fraction:
+        text += f".{fraction * (10**6 // ticks):06d}"
+    if pa.types.is_timestamp(kind):
+        text = date_text(days) + "T" + text
+    return text + suffix
 
 
 def json_scalar(scalar):
     if not scalar.is_valid:
         return None
     kind = scalar.type
-    if pa.types.is_timestamp(kind) and kind.unit == "ns":
-        # Python datetime only preserves microseconds. Format in Arrow so all
-        # nine fractional digits survive without requiring pandas.
-        fmt = "%Y-%m-%dT%H:%M:%S"
-        if kind.tz:
-            text = pc.strftime(scalar, format=fmt + "%z", locale="C").as_py()
-            return text[:-2] + ":" + text[-2:]
-        return pc.strftime(scalar, format=fmt, locale="C").as_py()
+    if pa.types.is_timestamp(kind) or pa.types.is_date(kind) or pa.types.is_time(kind):
+        return temporal_text(scalar)
     if pa.types.is_dictionary(kind):
         return json_scalar(scalar.value)
     if pa.types.is_struct(kind):
@@ -57,11 +101,16 @@ def json_scalar(scalar):
 
 
 def json_rows(batch):
-    columns = [
-        [json_scalar(value) for value in array] if contains_nanosecond_timestamp(array.type)
-        else array.to_pylist()
-        for array in batch.columns
-    ]
+    columns = []
+    for array in batch.columns:
+        if not needs_scalar_conversion(array.type):
+            try:
+                columns.append(array.to_pylist())
+                continue
+            except OverflowError:
+                # Python datetime supports only years 1 through 9999.
+                pass
+        columns.append([json_scalar(value) for value in array])
     for values in zip(*columns):
         yield dict(zip(batch.schema.names, values))
 
@@ -123,7 +172,8 @@ def scan(directory, required, projection):
 
 if __name__ == "__main__":
     try:
-        scan(sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3]))
+        required, projection = json.load(sys.stdin.buffer)
+        scan(sys.argv[1], required, projection)
     except (OSError, TypeError, ValueError) as error:
         sys.exit(f"Parquet: {error}")
 

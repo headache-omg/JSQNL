@@ -71,7 +71,7 @@ jsqnl exec users.jsqnl 'EXPLAIN ANALYZE SELECT name FROM users WHERE id = 2;'
 
 `jsqnl scan PARQUET_DIRECTORY 'SELECT ...;'` は、指定ディレクトリ直下の全Parquetファイルをファイル名順に読みます。対象テーブル名はディレクトリ名で、末尾が `data` の場合は親ディレクトリ名です。クエリは既存のJSQNLの `SELECT` を1文受け付け、WHEREの条件と列選択を順に適用します。必要列だけを読み、結果はJSONLで逐次出力します。対象は同一のArrowスキーマを持つシャードです。
 
-ディレクトリ名にハイフンや空白がある場合は、SQLで `FROM "my-data"` のように二重引用符で囲みます。
+ディレクトリ名や列名にハイフン・空白・日本語がある場合は、`SELECT "年度" FROM "my-data"` のように二重引用符で囲みます。
 
 Parquetの読み取りにはPyArrowが必要です。既定の `python3` で利用できるようにするか、`JSQNL_PYTHON` にインストール済みのPythonを指定してください。
 
@@ -192,7 +192,7 @@ RESONATE embedding FROM users WITH [1,0,0] WHERE age >= 18 LIMIT 5;
 
 ## 外部ハッシュ集計と一時領域
 
-GROUP BYは集計キーごとの状態をHashMapに保持し、推定メモリが既定の16 MiBを超えると256個のディスクパーティションに退避します。1パーティションずつ集計し、偏りでメモリ予算を超えるパーティションは一時SQLite集計に切り替えます。グループ数が多い場合も、ORDER BYなしなら結果を逐次出力します。ORDER BYはメモリ予算を超えると外部ソートを使います。LIMITを指定すると、必要な上位候補だけを残せます。集計の予算は `JSQNL_GROUP_MEMORY_BYTES` で変更できます。予算は推定ヒープ使用量で、プロセスのRSS上限ではありません。
+GROUP BYは集計キーごとの状態をHashMapに保持し、推定メモリが既定の16 MiBを超えると256個のディスクパーティションに退避します。1パーティションずつ集計し、偏りでメモリ予算を超えるパーティションは一時SQLite集計に切り替えます。ORDER BYを省略した集計結果は、各グループが元データに最初に現れた順に並びます。並べ替えは集計完了後に行います。ORDER BYはメモリ予算を超えると外部ソートを使います。LIMITを指定すると、必要な上位候補だけを残せます。集計の予算は `JSQNL_GROUP_MEMORY_BYTES` で変更できます。予算は推定ヒープ使用量で、プロセスのRSS上限ではありません。
 
 集計とGrace Hash Joinの一時データは、`TMPDIR` 内の利用者専用レジストリにクエリ単位で保存されます。CLI起動時および一時領域の確保時に、OSロックが解放されたディレクトリだけを回収します。Rustからは `jsqnl::recover_temporary_files()` を呼べます。クエリごとの一時容量は `JSQNL_TEMP_LIMIT_BYTES` で指定でき、既定は8 GiBです。集計とJOINを同時に行うクエリでは同じ予算を共有します。複数クエリの合計容量は各クエリの上限の合計まで増え得ます。
 

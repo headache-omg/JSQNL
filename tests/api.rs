@@ -226,3 +226,38 @@ fn format_readers_agree_on_schema_comments_line_endings_and_finite_numbers() {
         }
     }
 }
+
+#[test]
+fn reference_reader_matches_schema_tokens_and_validates_overwritten_values() {
+    let temp = Temp::new();
+    let path = temp.0.join("rows");
+    for (body, valid) in [
+        ("SCHEMA t (K INT)\n{}", false),
+        ("SCHEMA t (n ſTRING)\n{}", false),
+        ("SCHEMA t (n VECTOR(01))\n{}", false),
+        ("SCHEMA t (n VECTOR(18446744073709551616))\n{}", false),
+        ("SCHEMA t (n VECTOR(2)NOT NULL)\n{\"n\":[1,2]}", true),
+        ("SCHEMA t (n JSON)\n{\"n\":[\"\\ud800\"],\"n\":1}", false),
+        ("SCHEMA t (n INT)\n{\"n\":\r1}", false),
+        ("SCHEMA t (n TEXT) -- JSQNL: 9\n{\"n\":\"雪\"}", true),
+    ] {
+        fs::write(&path, body).unwrap();
+        assert_eq!(
+            execute(&path, "SELECT * FROM t;", |_| Ok(())).is_ok(),
+            valid,
+            "{body}"
+        );
+        let python = std::env::var_os("JSQNL_COMPAT_PYTHON").unwrap_or_else(|| "python3".into());
+        let read = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference_reader.py"))
+            .arg(&path)
+            .arg("t")
+            .env("PYTHONIOENCODING", "ascii")
+            .output()
+            .unwrap();
+        assert_eq!(read.status.success(), valid, "{body}: {read:?}");
+        if valid {
+            assert!(serde_json::from_slice::<Vec<Value>>(&read.stdout).is_ok());
+        }
+    }
+}

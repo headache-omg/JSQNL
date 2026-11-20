@@ -195,26 +195,38 @@ impl Table {
         }
     }
 
-    fn matching(&self, predicate: Option<&Predicate>) -> Result<Vec<u64>> {
-        if let Some(predicate) = predicate {
-            self.filter(predicate)?;
-            if let Some(candidate) = self.indexed_candidate(predicate) {
-                return Ok(candidate
-                    .into_iter()
-                    .filter(|id| {
-                        self.rows
-                            .get(id)
-                            .is_some_and(|(row, _)| matches(predicate, *id, row))
-                    })
-                    .collect());
+    fn visit_matches(
+        &self,
+        predicate: Option<&Predicate>,
+        mut visit: impl FnMut(u64, &Row) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(filter) = predicate {
+            self.filter(filter)?;
+            if let Some(candidate) = self.indexed_candidate(filter) {
+                if let Some(id) = candidate
+                    && let Some((row, _)) = self.rows.get(&id)
+                    && matches(filter, id, row)
+                {
+                    visit(id, row)?;
+                }
+                return Ok(());
             }
         }
-        Ok(self
-            .rows
-            .iter()
-            .filter(|(id, (row, _))| predicate.is_none_or(|p| matches(p, **id, row)))
-            .map(|(id, _)| *id)
-            .collect())
+        for (&id, (row, _)) in &self.rows {
+            if predicate.is_none_or(|filter| matches(filter, id, row)) {
+                visit(id, row)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn matching(&self, predicate: Option<&Predicate>) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        self.visit_matches(predicate, |id, _| {
+            ids.push(id);
+            Ok(())
+        })?;
+        Ok(ids)
     }
 }
 
@@ -398,18 +410,10 @@ pub(crate) struct SelectRows<'a> {
 
 impl<'a> SelectRows<'a> {
     pub(crate) fn new(columns: Option<&'a [String]>, options: &'a SelectOptions) -> Result<Self> {
-        Self::with_scratch(columns, options, None)
+        Self::with_slot(columns, options, ScratchSlot::default(), false)
     }
 
-    pub(crate) fn with_scratch(
-        columns: Option<&'a [String]>,
-        options: &'a SelectOptions,
-        scratch: Option<Rc<Scratch>>,
-    ) -> Result<Self> {
-        Self::with_slot(columns, options, ScratchSlot::new(scratch), false)
-    }
-
-    fn with_slot(
+    pub(crate) fn with_slot(
         columns: Option<&'a [String]>,
         options: &'a SelectOptions,
         scratch: ScratchSlot,
@@ -676,7 +680,12 @@ fn inject(old: Value, op: Op, value: Value, kind: &Kind) -> Result<Value> {
             _ => {}
         }
     }
-    if let (Some(a), Some(b)) = (integer(&old), integer(&value)) {
+    let operand = if matches!(kind, Kind::Int) {
+        integral_literal(&value)
+    } else {
+        integer(&value)
+    };
+    if let (Some(a), Some(b)) = (integer(&old), operand) {
         let result = match op {
             Op::Add => a.checked_add(b),
             Op::Sub => a.checked_sub(b),
@@ -789,13 +798,16 @@ impl Database {
         self.materialized = Some((0, bytes));
     }
 
+    fn row_weight(row: &Row) -> u64 {
+        128 + row
+            .iter()
+            .map(|(name, value)| 96 + name.len() as u64 + crate::aggregate::value_weight(value))
+            .sum::<u64>()
+    }
+
     fn charge_row(&mut self, row: &Row) -> Result<()> {
         if let Some((used, limit)) = &mut self.materialized {
-            let size = row
-                .iter()
-                .map(|(name, value)| 96 + name.len() as u64 + crate::aggregate::value_weight(value))
-                .sum::<u64>();
-            *used = used.saturating_add(size).saturating_add(128);
+            *used = used.saturating_add(Self::row_weight(row));
             ensure!(
                 *used <= *limit,
                 "materialization memory budget exceeded ({limit} bytes)"
@@ -873,6 +885,14 @@ impl Database {
     }
 
     pub fn apply(&mut self, change: &Change, location: Location) -> Result<()> {
+        // Replay and in-memory scripts retain only live rows. Write batches also retain pending changes.
+        if matches!(location.source, "log" | "script")
+            && let Change::Update { table, id, .. } | Change::Delete { table, id } = change
+            && let Some((row, _)) = self.tables.get(table).and_then(|state| state.rows.get(id))
+            && let Some((used, _)) = &mut self.materialized
+        {
+            *used = used.saturating_sub(Self::row_weight(row));
+        }
         if let Change::Insert { row, .. } | Change::Update { row, .. } = change {
             crate::import_json::validate_row_nodes(row)?;
             crate::limits::measure(row, crate::limits::record()? - 1)?;
@@ -1095,6 +1115,12 @@ impl Database {
         let changes = match statement {
             Statement::ExplainAnalyze(_) => bail!("EXPLAIN ANALYZE requires a database query"),
             Statement::Schema(table, columns) => vec![Change::Schema { table, columns }],
+            Statement::Row(Value::Object(row)) if location.source == "script" => {
+                let (table, id, _) = self.register_base_row(&row, true, false)?;
+                let table = table.to_owned();
+                self.retain_base_row(&table, id, row, location.offset)?;
+                Vec::new()
+            }
             Statement::Row(Value::Object(row)) => {
                 let table = self
                     .active_schema
@@ -1201,7 +1227,7 @@ impl Database {
                 let ids = state.matching(predicate.as_ref())?;
                 let mut changes = Vec::new();
                 for id in ids {
-                    let (row, _) = &state.rows[&id];
+                    let (row, _) = &self.table(&table)?.rows[&id];
                     let Some(value) = row
                         .get(&column)
                         .filter(|value| !value.is_null() && factor != 1.0)
@@ -1219,14 +1245,18 @@ impl Database {
                     if updated != *value {
                         let mut row = row.clone();
                         row.insert(column.clone(), updated);
-                        changes.push(Change::Update {
+                        let change = Change::Update {
                             table: table.clone(),
                             id,
                             row,
-                        });
+                        };
+                        self.apply(&change, location)?;
+                        if location.source != "script" {
+                            changes.push(change);
+                        }
                     }
                 }
-                changes
+                return Ok((changes, output, spill));
             }
             Statement::Resonate {
                 table,
@@ -1248,8 +1278,12 @@ impl Database {
                     anyhow!("RESONATE requires a nonzero VECTOR({dimension}) query")
                 })?;
                 let mut scores = Vec::new();
-                for id in state.matching(predicate.as_ref())? {
-                    let (row, _) = &state.rows[&id];
+                let best_first = |(ai, a): &(u64, f64), (bi, b): &(u64, f64)| {
+                    b.partial_cmp(a)
+                        .expect("finite cosine score")
+                        .then_with(|| ai.cmp(bi))
+                };
+                state.visit_matches(predicate.as_ref(), |id, row| {
                     if let Some(vector) = row
                         .get(&column)
                         .and_then(|value| unit_vector(value, dimension))
@@ -1261,19 +1295,21 @@ impl Database {
                             .sum::<f64>()
                             .clamp(-1.0, 1.0);
                         scores.push((id, score));
+                        if scores.len() > limit.saturating_mul(2) {
+                            scores.select_nth_unstable_by(limit, best_first);
+                            scores.truncate(limit);
+                        }
                     }
+                    Ok(())
+                })?;
+                scores.sort_unstable_by(best_first);
+                let result_limit = crate::limits::materialized()?;
+                let mut result_bytes = 0;
+                for (id, score) in scores.into_iter().take(limit) {
+                    let row = serde_json::json!({ "_line": id, "_score": score });
+                    crate::limits::charge_result(&mut result_bytes, result_limit, &row)?;
+                    output.push(row);
                 }
-                scores.sort_unstable_by(|(a_id, a), (b_id, b)| {
-                    b.partial_cmp(a)
-                        .expect("cosine scores are finite")
-                        .then_with(|| a_id.cmp(b_id))
-                });
-                output.extend(
-                    scores
-                        .into_iter()
-                        .take(limit)
-                        .map(|(id, score)| serde_json::json!({ "_line": id, "_score": score })),
-                );
                 Vec::new()
             }
             Statement::Select(table, columns, predicate, options) => {
@@ -1306,13 +1342,13 @@ impl Database {
                 self.validate_group_order(&table, &options)?;
                 let state = self.table(&table)?;
                 let mut results = SelectRows::new(columns.as_deref(), &options)?;
-                for id in state.matching(predicate.as_ref())? {
-                    let (row, _) = &state.rows[&id];
+                state.visit_matches(predicate.as_ref(), |id, row| {
                     if let Some(value) = results.push(id, row)? {
                         crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;
                         output.push(value);
                     }
-                }
+                    Ok(())
+                })?;
                 spill = results.finish_with(&mut |value| {
                     crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;
                     output.push(value);
@@ -1338,7 +1374,9 @@ impl Database {
                         row,
                     };
                     self.apply(&change, location)?;
-                    changes.push(change);
+                    if location.source != "script" {
+                        changes.push(change);
+                    }
                 }
                 return Ok((changes, output, spill));
             }

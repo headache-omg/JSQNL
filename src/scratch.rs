@@ -244,15 +244,15 @@ impl Drop for Scratch {
     }
 }
 
-pub(crate) struct KeyValidation<'a> {
-    scratch: &'a Scratch,
+pub(crate) struct KeyValidation {
+    scratch: ScratchSlot,
     database: Option<Connection>,
     reserved: u64,
     exclusive: bool,
 }
 
-impl<'a> KeyValidation<'a> {
-    pub(crate) fn new(scratch: &'a Scratch) -> Self {
+impl KeyValidation {
+    pub(crate) fn new(scratch: ScratchSlot) -> Self {
         Self {
             scratch,
             database: None,
@@ -262,7 +262,7 @@ impl<'a> KeyValidation<'a> {
     }
 
     /// Use when key validation is the only consumer of this scratch directory.
-    pub(crate) fn exclusive(scratch: &'a Scratch) -> Self {
+    pub(crate) fn exclusive(scratch: ScratchSlot) -> Self {
         Self {
             exclusive: true,
             ..Self::new(scratch)
@@ -271,12 +271,12 @@ impl<'a> KeyValidation<'a> {
 
     pub(crate) fn insert(&mut self, relation: &str, id: u64, key: &str) -> Result<()> {
         if self.database.is_none() {
+            let scratch = self.scratch.get()?;
             let (db, reserved) = if self.exclusive {
-                let remaining = self.scratch.limit - self.scratch.used.get();
-                self.scratch
-                    .reserve_sqlite_with_budget("keys.sqlite", remaining)?
+                let remaining = scratch.limit - scratch.used.get();
+                scratch.reserve_sqlite_with_budget("keys.sqlite", remaining)?
             } else {
-                self.scratch.reserve_sqlite("keys.sqlite")?
+                scratch.reserve_sqlite("keys.sqlite")?
             };
             db.execute_batch("CREATE TABLE keys (name TEXT, key TEXT, PRIMARY KEY (name, key)) WITHOUT ROWID; BEGIN;")?;
             self.database = Some(db);
@@ -297,10 +297,11 @@ impl<'a> KeyValidation<'a> {
         };
         database.execute_batch("COMMIT;")?;
         drop(database);
-        let path = self.scratch.path("keys.sqlite");
+        let scratch = self.scratch.get()?;
+        let path = scratch.path("keys.sqlite");
         let bytes = path.metadata()?.len();
         fs::remove_file(path)?;
-        self.scratch.release(self.reserved);
+        scratch.release(self.reserved);
         Ok(bytes)
     }
 }

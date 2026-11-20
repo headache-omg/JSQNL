@@ -1,7 +1,7 @@
 use crate::engine::{
     JoinVisitor, ResultSpill, Row, field, integral_literal, join_key_names, select_references,
 };
-use crate::scratch::{KeyValidation, PartitionWriters, Scratch};
+use crate::scratch::{KeyValidation, PartitionWriters, Scratch, ScratchSlot};
 use crate::storage::{BaseRead, walk_base};
 use crate::syntax::{Predicate, SelectOptions};
 use anyhow::{Result, ensure};
@@ -196,7 +196,7 @@ pub(crate) fn execute(
     };
     let left_fields = fields(options.alias.as_deref().unwrap_or(table), left_key);
     let right_fields = fields(join.alias.as_deref().unwrap_or(&join.table), right_key);
-    let mut validation = KeyValidation::new(&scratch);
+    let mut validation = KeyValidation::new(ScratchSlot::new(Some(scratch.clone())));
     let mut writers = PartitionWriters::default();
     let (db, rows, bytes) = walk_base(
         path,

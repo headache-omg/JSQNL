@@ -58,8 +58,10 @@ fn cli() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let command = args.first().and_then(|arg| arg.to_str());
     match (command, &args[1.min(args.len())..]) {
-        (None | Some("-h" | "--help" | "help"), []) => println!("{USAGE}"),
-        (Some("-V" | "--version"), []) => println!("jsqnl {}", env!("CARGO_PKG_VERSION")),
+        (None | Some("-h" | "--help" | "help"), []) => writeln!(io::stdout().lock(), "{USAGE}")?,
+        (Some("-V" | "--version"), []) => {
+            writeln!(io::stdout().lock(), "jsqnl {}", env!("CARGO_PKG_VERSION"))?
+        }
         (Some("init"), [path]) => jsqnl::init(Path::new(path))?,
         (Some("run"), [path]) => {
             let source =
