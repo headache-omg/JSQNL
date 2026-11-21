@@ -1,5 +1,5 @@
 use crate::disk_index;
-use crate::engine::Database;
+use crate::engine::{Database, ResultSpill};
 use crate::syntax::{Predicate, SelectOptions, Statement};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -95,9 +95,27 @@ pub struct QueryReport {
     pub spill_bytes_written: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oversized_partitions: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl QueryReport {
+    pub(crate) fn record_spill(&mut self, spill: ResultSpill) {
+        if spill.group != 0
+            && let Some(index) = self.operators.iter().position(|op| *op == "group")
+        {
+            self.operators.insert(index, "external_hash_aggregation");
+        }
+        if spill.sort != 0
+            && let Some(operator) = self.operators.iter_mut().find(|op| **op == "sort")
+        {
+            *operator = "external_sort";
+        }
+        if spill.bytes() != 0 {
+            self.spill_bytes_written = Some(self.spill_bytes_written.unwrap_or(0) + spill.bytes());
+        }
+    }
+
     pub(crate) fn new(access: AccessPath, statements: &[(u64, Statement)]) -> Self {
         let mut operators = vec![match access {
             AccessPath::SequentialScan => "sequential_scan",
@@ -123,7 +141,12 @@ impl QueryReport {
             if options.count.is_some() {
                 operators.push("count");
             }
-            if !options.order.is_empty() {
+            if !options.order.is_empty()
+                || !options.group.is_empty()
+                || (access == AccessPath::GraceHashJoin
+                    && options.group.is_empty()
+                    && options.count.is_none())
+            {
                 operators.push("sort");
             }
             if options.limit.is_some() || options.offset != 0 {
@@ -141,6 +164,7 @@ impl QueryReport {
             elapsed_ms: 0.0,
             spill_bytes_written: None,
             oversized_partitions: None,
+            warnings: Vec::new(),
         }
     }
 }

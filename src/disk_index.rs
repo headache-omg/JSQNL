@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn fingerprint(file: &File) -> Result<String> {
@@ -57,6 +58,8 @@ struct Seal {
     base: String,
     index: String,
     sha256: String,
+    max_line_bytes: Option<u64>,
+    validation_version: Option<u32>,
 }
 
 fn load_seal(index: &Path) -> Result<Option<Seal>> {
@@ -74,12 +77,20 @@ fn load_seal(index: &Path) -> Result<Option<Seal>> {
     Ok(serde_json::from_slice::<Seal>(&bytes).ok())
 }
 
-fn write_seal(index: &Path, base: String, sha256: String, stage: &Path) -> Result<()> {
+fn write_seal(
+    index: &Path,
+    base: String,
+    sha256: String,
+    max_line_bytes: u64,
+    stage: &Path,
+) -> Result<()> {
     let file = open_regular(index)?;
     let seal = Seal {
         base,
         index: fingerprint(&file)?,
         sha256,
+        max_line_bytes: Some(max_line_bytes),
+        validation_version: Some(2),
     };
     let mut writer = private_options().create_new(true).open(stage)?;
     serde_json::to_writer(&mut writer, &seal)?;
@@ -108,14 +119,14 @@ fn unexpected_sidecar(index: &Path) -> Result<Option<std::path::PathBuf>> {
 /// filesystem fingerprints, so index seek does not read or hash the SQLite file.
 pub(crate) fn check(path: &Path, base: &File) -> Result<Option<&'static str>> {
     let index = sidecar(path, ".seek.sqlite");
+    if unexpected_sidecar(&index)?.is_some() {
+        return Ok(Some("invalid"));
+    }
     let mut file = match open_regular(&index) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("opening disk index"),
     };
-    if unexpected_sidecar(&index)?.is_some() {
-        return Ok(Some("invalid"));
-    }
     let Some(seal) = load_seal(&index)? else {
         return Ok(Some("unsealed"));
     };
@@ -126,6 +137,9 @@ pub(crate) fn check(path: &Path, base: &File) -> Result<Option<&'static str>> {
     if before != seal.index || digest(&mut file)? != seal.sha256 || before != fingerprint(&file)? {
         return Ok(Some("invalid"));
     }
+    if seal.validation_version != Some(2) || seal.max_line_bytes.is_none() {
+        return Ok(Some("legacy"));
+    }
     Ok(Some("current"))
 }
 
@@ -135,10 +149,18 @@ pub fn build(path: &Path) -> Result<()> {
         !has_log(&path)?,
         "disk-index requires a base file without an update log"
     );
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let signature = fingerprint(&base)?;
     let index = sidecar(&path, ".seek.sqlite");
+    if let Some(auxiliary) = unexpected_sidecar(&index)? {
+        anyhow::bail!("unexpected disk index sidecar: {}", auxiliary.display());
+    }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let stage = sidecar(&index, &format!(".{nonce}.tmp"));
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stage = sidecar(
+        &index,
+        &format!(".{}.{nonce}.{sequence}.tmp", std::process::id()),
+    );
     let seal_stage = sidecar(&stage, ".seal");
     private_options().create_new(true).open(&stage)?;
     let result = (|| -> Result<()> {
@@ -153,6 +175,7 @@ pub fn build(path: &Path) -> Result<()> {
              ) WITHOUT ROWID;",
         )?;
         let transaction = sqlite.transaction()?;
+        let mut max_line_bytes = 0;
         {
             let mut schema = transaction.prepare("INSERT INTO schemas VALUES (?, ?)")?;
             let mut row = transaction.prepare("INSERT INTO offsets VALUES (?, ?, ?, ?)")?;
@@ -160,7 +183,7 @@ pub fn build(path: &Path) -> Result<()> {
                 &path,
                 &base,
                 BaseRead::BuildIndex,
-                |_| {},
+                |line| max_line_bytes = max_line_bytes.max(line.len() as u64),
                 |_, name, columns| {
                     schema.execute(params![name, serde_json::to_string(columns)?])?;
                     Ok(())
@@ -190,7 +213,7 @@ pub fn build(path: &Path) -> Result<()> {
         let sha256 = digest(&mut file)?;
         drop(file);
         std::fs::rename(&stage, &index)?;
-        write_seal(&index, signature, sha256, &seal_stage)?;
+        write_seal(&index, signature, sha256, max_line_bytes, &seal_stage)?;
         Ok(())
     })();
     if result.is_err() {
@@ -229,8 +252,14 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
     let Some(seal) = load_seal(&index)? else {
         return Ok(None);
     };
+    let limit = crate::limits::record()?;
+    // A seal built without line sizes cannot establish validity under this limit.
+    if seal.validation_version != Some(2) || seal.max_line_bytes.is_none_or(|size| size > limit) {
+        return Ok(None);
+    }
     let file = open_regular(&index)?;
-    if seal.base != fingerprint(base)? || seal.index != fingerprint(&file)? {
+    let index_before = fingerprint(&file)?;
+    if seal.base != fingerprint(base)? || seal.index != index_before {
         return Ok(None);
     }
     let sqlite = Connection::open_with_flags(
@@ -238,6 +267,12 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .with_context(|| format!("opening disk index {}", index.display()))?;
+    let after = open_regular(&index)?;
+    if fingerprint(&after)? != index_before {
+        return Ok(None);
+    }
+    drop(file);
+    drop(after);
     sqlite.pragma_update(None, "trusted_schema", false)?;
     let saved: String = sqlite.query_row("SELECT fingerprint FROM meta", [], |row| row.get(0))?;
     Ok((saved == fingerprint(base)?).then_some(sqlite))

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use jsqnl::{ImportFormat, import};
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 const USAGE: &str = "IN2JSQNL
@@ -14,10 +15,10 @@ fn set(slot: &mut Option<OsString>, key: &str, value: OsString) -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    jsqnl::recover_temporary_files()?;
+    let _ = jsqnl::recover_temporary_files();
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_none_or(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}");
+        writeln!(io::stdout().lock(), "{USAGE}")?;
         return Ok(());
     }
     let (mut schema, mut input, mut output, mut table, mut format) = (None, None, None, None, None);
@@ -62,7 +63,8 @@ fn run() -> Result<()> {
         _ => bail!("expected --format json or jsonl"),
     };
     let imported = import(schema, input, output, table.as_deref(), format)?;
-    println!("{}", serde_json::to_string(&imported)?);
+    writeln!(io::stdout().lock(), "{}", serde_json::to_string(&imported)?)
+        .context("output was published, but the import report could not be written")?;
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 fn filter_columns<'a>(predicate: &'a Predicate, names: &mut BTreeSet<&'a str>) {
     match predicate {
-        Predicate::Compare(name, ..) => {
+        Predicate::Compare(name, ..) | Predicate::IsNull(name, _) => {
             names.insert(name);
         }
         Predicate::And(terms) | Predicate::Or(terms) => {
@@ -32,24 +32,25 @@ pub fn scan(
         options.join.is_none(),
         "JOIN requires tables in one .jsqnl database"
     );
-    let directory = directory
+    fn table_name(path: &Path) -> Option<&str> {
+        let table = if path.file_name()? == "data" {
+            path.parent()?
+        } else {
+            path
+        };
+        table.file_name()?.to_str()
+    }
+    let requested = std::path::absolute(directory)?;
+    let directory = requested
         .canonicalize()
         .context("opening Parquet directory")?;
     ensure!(directory.is_dir(), "scan requires a Parquet directory");
-    let table_directory = if directory.file_name().is_some_and(|name| name == "data") {
-        directory
-            .parent()
-            .context("Parquet data directory has no parent")?
-    } else {
-        directory.as_path()
-    };
-    let expected_table = table_directory
-        .file_name()
-        .and_then(|name| name.to_str())
+    let expected = table_name(&requested)
+        .or_else(|| table_name(&directory))
         .context("cannot derive a table name from the directory")?;
     ensure!(
-        table == expected_table,
-        "unknown table {table}; this directory provides {expected_table}"
+        table == expected || table_name(&directory) == Some(table.as_str()),
+        "unknown table {table}; this directory provides {expected}"
     );
 
     let mut required = BTreeSet::new();
@@ -70,20 +71,34 @@ pub fn scan(
         .arg("-c")
         .arg(include_str!("parquet_reader.py"))
         .arg(directory)
-        .arg(serde_json::to_string(&required)?)
-        .arg(serde_json::to_string(&projection)?)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context(
             "starting the Parquet reader; set JSQNL_PYTHON to a Python with PyArrow installed",
         )?;
     let stdout = reader.stdout.take().expect("reader stdout is piped");
+    let stderr = reader.stderr.take().expect("reader stderr is piped");
+    let mut stderr_task = Some(std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = stderr.take(64 * 1024).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).trim().to_owned()
+    }));
     let result = (|| -> Result<()> {
+        {
+            let mut request =
+                std::io::BufWriter::new(reader.stdin.take().context("missing reader stdin")?);
+            serde_json::to_writer(&mut request, &(&required, projection))?;
+            std::io::Write::flush(&mut request)?;
+        }
         let mut input = BufReader::new(stdout);
         let mut line = String::new();
         let mut id = 0;
         let mut results = SelectRows::new(columns.as_deref(), options)?;
         let record_limit = crate::limits::record()?;
+        let mut stopped_early = false;
         while crate::limits::line(&mut input, &mut line, record_limit)? != 0 {
             id += 1;
             let row = crate::import_json::bounded_row(&line)
@@ -96,14 +111,40 @@ pub fn scan(
                 emit(value)?;
             }
             line.clear();
+            if results.is_saturated() {
+                stopped_early = true;
+                break;
+            }
         }
-        ensure!(reader.wait()?.success(), "Parquet scan failed");
+        drop(input);
+        if stopped_early {
+            let _ = reader.kill();
+            let _ = reader.wait();
+            if let Some(task) = stderr_task.take() {
+                let _ = task.join();
+            }
+        } else {
+            let status = reader.wait()?;
+            let detail = stderr_task
+                .take()
+                .and_then(|task| task.join().ok())
+                .unwrap_or_default();
+            if !status.success() {
+                if detail.is_empty() {
+                    bail!("Parquet scan failed");
+                }
+                bail!("{detail}");
+            }
+        }
         results.finish_with(&mut emit)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = reader.kill();
         let _ = reader.wait();
+        if let Some(task) = stderr_task.take() {
+            let _ = task.join();
+        }
     }
     result
 }

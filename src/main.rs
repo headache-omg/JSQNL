@@ -42,24 +42,40 @@ fn write_query(
     Ok(())
 }
 
-fn read_source(input: impl Read) -> Result<String> {
-    let mut source = String::new();
-    input
-        .take(jsqnl::QUERY_LIMIT_BYTES + 1)
-        .read_to_string(&mut source)?;
-    ensure!(
-        source.len() as u64 <= jsqnl::QUERY_LIMIT_BYTES,
-        "query or script exceeds byte limit"
-    );
-    Ok(source)
+fn read_source(mut input: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let count = match input.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            (bytes.len() as u64).saturating_add(count as u64) <= jsqnl::QUERY_LIMIT_BYTES,
+            "query or script exceeds byte limit"
+        );
+        bytes.try_reserve(count).map_err(io::Error::other)?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+        .into()
+    })
 }
 
 fn cli() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let command = args.first().and_then(|arg| arg.to_str());
     match (command, &args[1.min(args.len())..]) {
-        (None | Some("-h" | "--help" | "help"), []) => println!("{USAGE}"),
-        (Some("-V" | "--version"), []) => println!("jsqnl {}", env!("CARGO_PKG_VERSION")),
+        (None | Some("-h" | "--help" | "help"), []) => writeln!(io::stdout().lock(), "{USAGE}")?,
+        (Some("-V" | "--version"), []) => {
+            writeln!(io::stdout().lock(), "jsqnl {}", env!("CARGO_PKG_VERSION"))?
+        }
         (Some("init"), [path]) => jsqnl::init(Path::new(path))?,
         (Some("run"), [path]) => {
             let source =
@@ -72,7 +88,15 @@ fn cli() -> Result<()> {
             } else {
                 read_source(io::stdin().lock())?
             };
-            write_query(|emit| jsqnl::execute(Path::new(path), &source, emit).map(|_| ()))?;
+            let mut warnings = Vec::new();
+            write_query(|emit| {
+                let report = jsqnl::execute(Path::new(path), &source, emit)?;
+                warnings = report.warnings;
+                Ok(())
+            })?;
+            for warning in warnings {
+                eprintln!("jsqnl: {warning}");
+            }
         }
         (Some("scan"), [path, sql]) => {
             let sql = sql.to_str().context("SQL must be UTF-8")?;
@@ -88,7 +112,9 @@ fn cli() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = jsqnl::recover_temporary_files().and_then(|_| cli()) {
+    // Scratch creation retries recovery when a command actually needs it.
+    let _ = jsqnl::recover_temporary_files();
+    if let Err(error) = cli() {
         eprintln!("jsqnl: {}", jsqnl::terminal_diagnostic(&error));
         std::process::exit(1);
     }

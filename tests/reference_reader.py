@@ -8,7 +8,7 @@ IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
 TYPES = dict(INTEGER="INT", NUMBER="FLOAT", REAL="FLOAT", STRING="TEXT", BOOLEAN="BOOL")
 COLUMN = re.compile(
     rf"({IDENTIFIER})\s+(INT|INTEGER|FLOAT|NUMBER|REAL|TEXT|STRING|BOOL|BOOLEAN|JSON|VECTOR\s*\(\s*[0-9]+\s*\))"
-    r"((?:\s+(?:NOT\s+NULL|PRIMARY\s+KEY))*)", re.IGNORECASE,
+    r"((?:(?:\s+|(?<=\)))(?:NOT\s+NULL|PRIMARY\s+KEY))*)", re.IGNORECASE | re.ASCII,
 )
 
 
@@ -21,6 +21,15 @@ def finite_number(text):
     if not math.isfinite(value):
         reject("non-finite number")
     return value
+
+
+def parse_integer(text):
+    if text == "-0":
+        return -0.0
+    value = int(text)
+    if -(2**63) <= value < 2**64:
+        return value
+    return finite_number(text)
 
 
 def is_number(value):
@@ -44,7 +53,8 @@ def valid(value, kind, required, dimension):
 
 
 def read_schema(text):
-    match = re.fullmatch(rf"({IDENTIFIER})\s*\((.*)\)\s*;?\s*(?:--.*)?", text)
+    definition = "".join(" " if char.isspace() else char for char in text.split("--", 1)[0])
+    match = re.fullmatch(rf"({IDENTIFIER})\s*\((.*)\)\s*;?\s*", definition)
     if not match:
         reject("invalid SCHEMA")
     name, raw_columns = match.groups()
@@ -60,8 +70,9 @@ def read_schema(text):
         kind = kind.upper()
         dimension = None
         if kind.startswith("VECTOR"):
-            dimension = int(re.search(r"[0-9]+", kind).group())
-            if dimension == 0:
+            digits = re.search(r"[0-9]+", kind).group()
+            dimension = int(digits)
+            if digits.startswith("0") or dimension > 2 * sys.maxsize + 1:
                 reject("invalid VECTOR dimension")
             kind = "VECTOR"
         kind = TYPES.get(kind, kind)
@@ -76,19 +87,41 @@ def read_schema(text):
     return name, columns, primary
 
 
+def checked_members(pairs):
+    # Validate every member before last-value-wins discards duplicate members.
+    result = {}
+    for key, value in pairs:
+        key.encode("utf-8")
+        validate_strings(value)
+        result[key] = value
+    return result
+
+
+def validate_strings(value):
+    if isinstance(value, str):
+        value.encode("utf-8")
+    elif isinstance(value, list):
+        for item in value:
+            validate_strings(item)
+    # Object members were checked by the nested object_pairs_hook.
+
+
 def read(path):
     schemas = {}
     tables = {}
     current = None
-    with open(path, encoding="utf-8-sig", newline="") as source:
+    with open(path, encoding="utf-8-sig", newline="\n") as source:
         for number, line in enumerate(source, 1):
+            if "\r" in line.removesuffix("\n").removesuffix("\r"):
+                reject("invalid physical line")
             text = line.strip()
-            header = re.fullmatch(r"--\s*JSQNL:\s*(.*)", text, re.IGNORECASE)
+            directive = "".join(" " if char.isspace() else char for char in text) if not text.startswith("{") else text
+            header = re.fullmatch(r"--\s*JSQNL:\s*(.*)", directive, re.IGNORECASE | re.ASCII)
             if header:
                 if number != 1 or header[1] != "1":
                     reject("unsupported version or position")
                 continue
-            schema = re.match(r"(?:--\s*SCHEMA:\s*|SCHEMA\s+)(.*)", text, re.IGNORECASE)
+            schema = re.match(r"(?:--\s*SCHEMA:\s*|SCHEMA\s+)(.*)", directive, re.IGNORECASE | re.ASCII)
             if schema:
                 current, columns, primary = read_schema(schema[1])
                 if current in schemas:
@@ -100,14 +133,10 @@ def read(path):
                 continue
             if current is None:
                 reject("JSONL row before SCHEMA")
-            if "\r" in line.rstrip("\r\n"):
-                reject("invalid physical line")
             row = json.loads(text, parse_constant=reject, parse_float=finite_number,
-                             parse_int=lambda n: -0.0 if n == "-0" else int(n))
+                             parse_int=parse_integer, object_pairs_hook=checked_members)
             if not isinstance(row, dict):
                 reject("expected a JSON object")
-            # Disallow isolated surrogate escapes throughout the object.
-            json.dumps(row, ensure_ascii=False).encode("utf-8")
             columns, primary, keys = schemas[current]
             if row.keys() - columns.keys() or any(
                 not valid(row.get(field), *rule) for field, rule in columns.items()
@@ -124,6 +153,8 @@ def read(path):
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(read(sys.argv[1])[sys.argv[2]], ensure_ascii=False, allow_nan=False))
+        text = json.dumps(read(sys.argv[1])[sys.argv[2]], ensure_ascii=False, allow_nan=False)
+        sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
     except (ValueError, KeyError, OSError) as error:
         sys.exit(str(error))
+

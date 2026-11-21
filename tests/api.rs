@@ -151,6 +151,7 @@ fn rust_and_reference_reader_reject_incompatible_files() {
         "-- SCHEMA: t (n INT NOT NULL)\n{\"n\":null}\n",
         "-- SCHEMA: t (n INT PRIMARY KEY)\n{\"n\":1}\n{\"n\":1}\n",
         "-- SCHEMA: t (n JSON)\n{\"n\": 1e400}\n",
+        "-- SCHEMA: t (n INT)\n{\"n\":1}\r \n",
     ] {
         fs::write(&path, source).unwrap();
         assert!(
@@ -192,4 +193,86 @@ fn query_callback_can_reenter_the_same_database() {
     assert_eq!(seen, [json!({"n":1}), json!({"n":2})]);
     assert_eq!(stored, [json!({"n":1}), json!({"n":20})]);
     worker.join().unwrap();
+}
+
+#[test]
+fn format_readers_agree_on_schema_comments_line_endings_and_finite_numbers() {
+    let dir = Temp::new();
+    let path = dir.0.join("db.jsqnl");
+    for (contents, valid) in [
+        (
+            "-- SCHEMA: t (x INT) -- note (units)\r\n{\"x\":1}\r\n".to_owned(),
+            true,
+        ),
+        ("-- SCHEMA: t (x INT)\r{\"x\":1}\r".to_owned(), false),
+        (
+            format!("-- SCHEMA: t (x FLOAT)\n{{\"x\":1{}}}\n", "0".repeat(309)),
+            false,
+        ),
+    ] {
+        fs::write(&path, contents).unwrap();
+        let mut rows = Vec::new();
+        let rust = execute(&path, "SELECT x FROM t;", |row| {
+            rows.push(row);
+            Ok(())
+        });
+        let python = reference(&path, "t");
+        assert_eq!(rust.is_ok(), valid, "{rust:?}");
+        assert_eq!(python.status.success(), valid, "{python:?}");
+        if valid {
+            assert_eq!(
+                serde_json::from_slice::<Vec<Value>>(&python.stdout).unwrap(),
+                rows
+            );
+        }
+    }
+}
+
+#[test]
+fn reference_reader_matches_schema_tokens_and_validates_overwritten_values() {
+    let temp = Temp::new();
+    let path = temp.0.join("rows");
+    for (body, valid) in [
+        ("SCHEMA t (K INT)\n{}", false),
+        ("SCHEMA t (n ſTRING)\n{}", false),
+        ("SCHEMA t (n VECTOR(01))\n{}", false),
+        ("SCHEMA t (n VECTOR(18446744073709551616))\n{}", false),
+        ("SCHEMA t (n VECTOR(2)NOT NULL)\n{\"n\":[1,2]}", true),
+        ("SCHEMA t (n JSON)\n{\"n\":[\"\\ud800\"],\"n\":1}", false),
+        ("SCHEMA t (n INT)\n{\"n\":\r1}", false),
+        ("SCHEMA t (n TEXT) -- ordinary note\n{\"n\":\"雪\"}", true),
+    ] {
+        fs::write(&path, body).unwrap();
+        assert_eq!(
+            execute(&path, "SELECT * FROM t;", |_| Ok(())).is_ok(),
+            valid,
+            "{body}"
+        );
+        let python = std::env::var_os("JSQNL_COMPAT_PYTHON").unwrap_or_else(|| "python3".into());
+        let read = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference_reader.py"))
+            .arg(&path)
+            .arg("t")
+            .env("PYTHONIOENCODING", "ascii")
+            .output()
+            .unwrap();
+        assert_eq!(read.status.success(), valid, "{body}: {read:?}");
+        if valid {
+            assert!(serde_json::from_slice::<Vec<Value>>(&read.stdout).is_ok());
+        }
+    }
+}
+
+#[test]
+fn parquet_scan_propagates_reader_stderr_in_error() {
+    let dir = Temp::new();
+    let table_dir = dir.0.join("items");
+    fs::create_dir(&table_dir).unwrap();
+    let error = jsqnl::scan_parquet(&table_dir, "SELECT * FROM items;", |_| Ok(()))
+        .expect_err("empty parquet directory or missing pyarrow must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("Parquet:"),
+        "expected reader stderr details in error, got: {message}"
+    );
 }

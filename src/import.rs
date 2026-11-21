@@ -1,6 +1,6 @@
 use crate::engine::{Change, Database, Location, Row};
 use crate::import_json::StrictValue;
-use crate::scratch::{KeyValidation, Scratch};
+use crate::scratch::{KeyValidation, ScratchSlot};
 use crate::storage::{open_regular, private_options, sidecar, sync_parent};
 use crate::syntax::{Kind, parse_import_tables};
 use anyhow::{Context, Result, bail, ensure};
@@ -78,18 +78,21 @@ pub fn import(
     let schema = schema.as_ref();
     let input = input.as_ref();
     let output = output.as_ref();
-    let mut sql = String::new();
     let mut schema_file =
         open_regular(schema).with_context(|| format!("opening SQL schema {}", schema.display()))?;
     let schema_before = schema_file.metadata()?;
-    (&mut schema_file)
-        .take(SQL_LIMIT + 1)
-        .read_to_string(&mut sql)?;
+    let sql_bytes = crate::limits::read_bytes(
+        &mut schema_file,
+        SQL_LIMIT,
+        "SQL definition exceeds byte limit",
+    )?;
     unchanged(schema, &schema_file, &schema_before)?;
-    ensure!(
-        sql.len() as u64 <= SQL_LIMIT,
-        "SQL definition exceeds byte limit"
-    );
+    let sql = String::from_utf8(sql_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SQL definition must be UTF-8",
+        )
+    })?;
 
     let mut tables = parse_import_tables(&sql)?;
     let table = match table {
@@ -112,7 +115,8 @@ pub fn import(
         open_regular(input).with_context(|| format!("opening input {}", input.display()))?;
     let input_before = source.metadata()?;
     let mut reader = BufReader::new(&source);
-    if reader.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
+    let has_bom = reader.fill_buf()?.starts_with(b"\xef\xbb\xbf");
+    if has_bom {
         reader.consume(3);
     }
 
@@ -165,13 +169,11 @@ pub fn import(
     writeln!(writer, "-- JSQNL: 1")?;
     writer.write_all(header.as_bytes())?;
 
-    let scratch = table
+    let mut keys = table
         .columns
         .iter()
         .any(|column| column.primary)
-        .then(Scratch::new)
-        .transpose()?;
-    let mut keys = scratch.as_ref().map(KeyValidation::new);
+        .then(|| KeyValidation::exclusive(ScratchSlot::default()));
     let mut row_number = 0;
     let mut write_row = |row: Row| -> Result<()> {
         row_number += 1;
@@ -199,11 +201,19 @@ pub fn import(
         ImportFormat::Jsonl => {
             let mut line = String::new();
             let mut number = 1;
-            while crate::limits::line(&mut reader, &mut line, limit)
-                .with_context(|| format!("JSONL line {number}"))?
+            while crate::limits::line(
+                &mut reader,
+                &mut line,
+                if number == 1 && has_bom {
+                    limit - 3
+                } else {
+                    limit
+                },
+            )
+            .with_context(|| format!("JSONL line {number}"))?
                 != 0
             {
-                if !line.trim().is_empty() {
+                if !line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
                     let value = serde_json::from_str::<StrictValue>(&line)
                         .with_context(|| format!("JSONL line {number}"))?;
                     let row = into_row(value).with_context(|| format!("JSONL line {number}"))?;

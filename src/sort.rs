@@ -73,11 +73,12 @@ impl<'a> Sorter<'a> {
     }
 
     fn weight(row: &OrderedRow) -> u64 {
-        128 + row
-            .1
-            .iter()
-            .map(crate::aggregate::value_weight)
-            .sum::<u64>()
+        128 + (row.1.capacity() * std::mem::size_of::<Value>()) as u64
+            + row
+                .1
+                .iter()
+                .map(crate::aggregate::value_weight)
+                .sum::<u64>()
             + crate::aggregate::value_weight(&row.2)
     }
 
@@ -111,13 +112,12 @@ impl<'a> Sorter<'a> {
     }
 
     fn write(&self, writer: &mut BufWriter<File>, bytes: &mut u64, row: OrderedRow) -> Result<()> {
-        let data = serde_json::to_vec(&row)?;
+        let data = crate::limits::encode_with(
+            &row,
+            self.frame_limit - 1,
+            "sort record exceeds byte limit",
+        )?;
         let size = data.len() as u64 + 1;
-        anyhow::ensure!(
-            size <= self.frame_limit,
-            "sort record exceeds byte limit ({})",
-            self.frame_limit
-        );
         self.scratch.get()?.account(size)?;
         writer.write_all(&data)?;
         writer.write_all(b"\n")?;

@@ -99,6 +99,7 @@ pub enum Op {
 #[derive(Clone, Debug)]
 pub enum Predicate {
     Compare(String, Op, Value),
+    IsNull(String, bool),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
 }
@@ -107,6 +108,7 @@ pub enum Predicate {
 enum Token {
     Word(String),
     Identifier(String),
+    Quoted(String),
     Value(Value),
     Symbol(String),
     Header,
@@ -140,17 +142,19 @@ pub(crate) fn validate_version_line(line: &str, first_line: bool) -> Result<()> 
     Ok(())
 }
 
-fn lex(source: &str) -> Result<Vec<Located>> {
-    lex_mode(source, false)
-}
-
-fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
+fn lex_mode(source: &str, ddl: bool, first_line: bool) -> Result<Vec<Located>> {
     let mut result = Vec::new();
     let mut offset = 0;
     while offset < source.len() {
         let rest = &source[offset..];
         let first = rest.chars().next().unwrap();
-        if first.is_whitespace() || (offset == 0 && first == '\u{feff}') {
+        if first.is_whitespace() || (first_line && offset == 0 && first == '\u{feff}') {
+            if !ddl && (first == '\n' || offset + first.len_utf8() == source.len()) {
+                let prefix = source[..offset].rsplit('\n').next().unwrap_or_default();
+                if prefix.trim_start_matches('\u{feff}').trim().is_empty() {
+                    check_record_line(&source[offset - prefix.len()..offset + first.len_utf8()])?;
+                }
+            }
             offset += first.len_utf8();
             continue;
         }
@@ -163,11 +167,22 @@ fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
         }
         let (token, len) = if rest.starts_with("--") {
             let line = rest.split('\n').next().unwrap();
+            let prefix = source[..offset].rsplit('\n').next().unwrap_or_default();
+            let standalone = !ddl && prefix.trim_start_matches('\u{feff}').trim().is_empty();
+            if standalone {
+                let physical_end = offset
+                    + line.len()
+                    + usize::from(rest.as_bytes().get(line.len()) == Some(&b'\n'));
+                check_record_line(&source[offset - prefix.len()..physical_end])?;
+            }
             if !ddl {
-                validate_version_line(line, !source[..offset].contains('\n'))?;
+                validate_version_line(
+                    line,
+                    first_line && standalone && !source[..offset].contains('\n'),
+                )?;
             }
             let body = line[2..].trim_start();
-            if !ddl
+            if standalone
                 && body
                     .get(..7)
                     .is_some_and(|p| p.eq_ignore_ascii_case("SCHEMA:"))
@@ -197,8 +212,14 @@ fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
                     .take_while(|b| b.is_ascii_digit())
                     .count();
             }
-            let value =
-                serde_json::from_str(&rest[..len]).map_err(|e| anyhow!("byte {offset}: {e}"))?;
+            let literal = &rest[..len];
+            let literal = if ddl && literal.bytes().all(|b| b.is_ascii_digit()) {
+                let digits = literal.trim_start_matches('0');
+                if digits.is_empty() { "0" } else { digits }
+            } else {
+                literal
+            };
+            let value = serde_json::from_str(literal).map_err(|e| anyhow!("byte {offset}: {e}"))?;
             (Token::Value(value), len)
         } else if ddl && matches!(first, '"' | '`' | '[') {
             let close = if first == '[' { ']' } else { first };
@@ -222,7 +243,11 @@ fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
                 .next()
                 .unwrap()
                 .map_err(|e| anyhow!("byte {offset}: {e}"))?;
-            (Token::Value(value.0), values.byte_offset())
+            let token = match value.0 {
+                Value::String(text) => Token::Quoted(text),
+                value => Token::Value(value),
+            };
+            (token, values.byte_offset())
         } else if first == '\'' {
             let mut value = String::new();
             let mut chars = rest.char_indices().skip(1).peekable();
@@ -277,9 +302,26 @@ struct Parser {
     pos: usize,
 }
 
+pub(crate) fn check_record_line(line: &str) -> Result<()> {
+    ensure!(
+        crate::limits::valid_line_ending(line),
+        "invalid physical line"
+    );
+    let limit = crate::limits::record()?;
+    ensure!(
+        line.len() as u64 <= limit,
+        "record exceeds byte limit ({limit})"
+    );
+    Ok(())
+}
+
 pub fn parse(source: &str) -> Result<Vec<(u64, Statement)>> {
+    parse_line(source, true)
+}
+
+pub(crate) fn parse_line(source: &str, first_line: bool) -> Result<Vec<(u64, Statement)>> {
     let mut parser = Parser {
-        tokens: lex(source)?,
+        tokens: lex_mode(source, false, first_line)?,
         pos: 0,
     };
     let mut statements = Vec::new();
@@ -296,25 +338,41 @@ pub fn parse(source: &str) -> Result<Vec<(u64, Statement)>> {
             .statement()
             .map_err(|e| anyhow!("line {line}, byte {offset}: {e}"))?;
         if matches!(statement, Statement::Row(_) | Statement::Schema(..)) {
+            let line_prefix = source[..offset].rsplit('\n').next().unwrap();
+            let line_suffix = source[offset..].split_inclusive('\n').next().unwrap();
+            check_record_line(&source[offset - line_prefix.len()..offset + line_suffix.len()])
+                .with_context(|| format!("line {line}"))?;
+            let prefix = if line == 1 {
+                line_prefix.strip_prefix('\u{feff}').unwrap_or(line_prefix)
+            } else {
+                line_prefix
+            };
             if matches!(statement, Statement::Row(_)) {
-                let end = source[offset..].split('\n').next().unwrap();
-                let prefix = source[..offset]
-                    .rsplit('\n')
-                    .next()
-                    .unwrap()
-                    .trim_start_matches('\u{feff}');
                 ensure!(
                     prefix.trim().is_empty()
-                        && serde_json::from_str::<crate::import_json::BoundedValue>(end).is_ok(),
+                        && serde_json::from_str::<crate::import_json::BoundedValue>(
+                            line_suffix.trim_end()
+                        )
+                        .is_ok(),
                     "line {line}: JSONL requires one object per physical line"
                 );
             } else {
+                ensure!(
+                    prefix.trim().is_empty(),
+                    "line {line}: SCHEMA must occupy its own line"
+                );
                 let last = parser.tokens[parser.pos - 1].offset;
                 ensure!(
                     !source[offset..last].contains('\n'),
                     "line {line}: SCHEMA must fit on one line"
                 );
-                parser.symbol(";");
+                if parser
+                    .tokens
+                    .get(parser.pos)
+                    .is_some_and(|next| !source[offset..next.offset].contains('\n'))
+                {
+                    parser.symbol(";");
+                }
                 if let Some(next) = parser.tokens.get(parser.pos) {
                     ensure!(
                         source[offset..next.offset].contains('\n'),
@@ -350,7 +408,7 @@ fn validate_import_identifier(name: &str) -> Result<()> {
 
 pub(crate) fn parse_import_tables(source: &str) -> Result<Vec<ImportTable>> {
     let mut parser = Parser {
-        tokens: lex_mode(source, true)?,
+        tokens: lex_mode(source, true, true)?,
         pos: 0,
     };
     let mut tables = Vec::new();
@@ -421,6 +479,11 @@ impl Parser {
         }
         if self.word("FALSE") {
             return Ok(Value::Bool(false));
+        }
+        if let Some(Token::Quoted(value)) = self.peek() {
+            let value = Value::String(value.clone());
+            self.pos += 1;
+            return Ok(value);
         }
         let negative = self.symbol("-");
         let Some(Token::Value(value)) = self.peek() else {
@@ -500,6 +563,11 @@ impl Parser {
     }
 
     fn column_reference(&mut self) -> Result<String> {
+        if let Some(Token::Quoted(name)) = self.peek() {
+            let name = name.clone();
+            self.pos += 1;
+            return Ok(name);
+        }
         let mut name = self.name()?;
         if self.symbol(".") {
             name.push('.');
@@ -521,11 +589,7 @@ impl Parser {
         if self.word("IS") {
             let negate = self.word("NOT");
             self.expect_word("NULL")?;
-            return Ok(Predicate::Compare(
-                name,
-                if negate { Op::Ne } else { Op::Eq },
-                Value::Null,
-            ));
+            return Ok(Predicate::IsNull(name, !negate));
         }
         if self.word("BETWEEN") {
             let lower = self.value()?;
@@ -538,8 +602,11 @@ impl Parser {
         }
         if self.word("IN") {
             self.expect_symbol("(")?;
-            let values = self.list(Self::value)?;
+            let mut values = self.list(Self::value)?;
             self.expect_symbol(")")?;
+            if values.len() == 1 {
+                return Ok(Predicate::Compare(name, Op::Eq, values.pop().unwrap()));
+            }
             return Ok(Predicate::Or(
                 values
                     .into_iter()
@@ -781,7 +848,15 @@ impl Parser {
                 (!columns.is_empty()).then_some(columns)
             };
             self.expect_word("FROM")?;
-            let table = self.name()?;
+            let table = if let Some(Token::Value(Value::String(name)) | Token::Quoted(name)) =
+                self.peek()
+            {
+                let name = name.clone();
+                self.pos += 1;
+                name
+            } else {
+                self.name()?
+            };
             options.alias = self.table_alias()?;
             let left = self.word("LEFT");
             if left {
@@ -898,7 +973,7 @@ impl Parser {
             let factor = self
                 .value()?
                 .as_f64()
-                .filter(|factor| (0.0..=1.0).contains(factor))
+                .filter(|factor| (0.0..=1.0).contains(factor) && !factor.is_sign_negative())
                 .ok_or_else(|| anyhow!("DECAY factor must be a number between 0 and 1"))?;
             Ok(Statement::Decay {
                 table,

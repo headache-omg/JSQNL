@@ -157,7 +157,7 @@ impl Table {
 
     fn filter(&self, predicate: &Predicate) -> Result<()> {
         match predicate {
-            Predicate::Compare(name, _, _) => ensure!(
+            Predicate::Compare(name, ..) | Predicate::IsNull(name, _) => ensure!(
                 name == "_line" || self.has_column(name),
                 "unknown column {name}"
             ),
@@ -195,26 +195,38 @@ impl Table {
         }
     }
 
-    fn matching(&self, predicate: Option<&Predicate>) -> Result<Vec<u64>> {
-        if let Some(predicate) = predicate {
-            self.filter(predicate)?;
-            if let Some(candidate) = self.indexed_candidate(predicate) {
-                return Ok(candidate
-                    .into_iter()
-                    .filter(|id| {
-                        self.rows
-                            .get(id)
-                            .is_some_and(|(row, _)| matches(predicate, *id, row))
-                    })
-                    .collect());
+    fn visit_matches(
+        &self,
+        predicate: Option<&Predicate>,
+        mut visit: impl FnMut(u64, &Row) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(filter) = predicate {
+            self.filter(filter)?;
+            if let Some(candidate) = self.indexed_candidate(filter) {
+                if let Some(id) = candidate
+                    && let Some((row, _)) = self.rows.get(&id)
+                    && matches(filter, id, row)
+                {
+                    visit(id, row)?;
+                }
+                return Ok(());
             }
         }
-        Ok(self
-            .rows
-            .iter()
-            .filter(|(id, (row, _))| predicate.is_none_or(|p| matches(p, **id, row)))
-            .map(|(id, _)| *id)
-            .collect())
+        for (&id, (row, _)) in &self.rows {
+            if predicate.is_none_or(|filter| matches(filter, id, row)) {
+                visit(id, row)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn matching(&self, predicate: Option<&Predicate>) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        self.visit_matches(predicate, |id, _| {
+            ids.push(id);
+            Ok(())
+        })?;
+        Ok(ids)
     }
 }
 
@@ -248,7 +260,10 @@ fn integer(value: &Value) -> Option<i128> {
 pub(crate) fn integral_literal(value: &Value) -> Option<i128> {
     integer(value).or_else(|| {
         let float = value.as_f64()?;
-        (float.fract() == 0.0).then_some(float as i128)
+        const MIN_I128: f64 = -170141183460469231731687303715884105728.0; // -2^127
+        const MAX_I128_EXCL: f64 = 170141183460469231731687303715884105728.0; // 2^127
+        (float.is_finite() && float.fract() == 0.0 && (MIN_I128..MAX_I128_EXCL).contains(&float))
+            .then_some(float as i128)
     })
 }
 
@@ -332,7 +347,9 @@ impl PartialEq for SqlKey {
 
 impl Eq for SqlKey {}
 
-pub(crate) type OrderedRow = (u64, Vec<Value>, Value);
+// Stable source IDs survive changes to join partitioning and spill order.
+pub(crate) type RowOrder = (u64, u64);
+pub(crate) type OrderedRow = (RowOrder, Vec<Value>, Value);
 
 pub(crate) type JoinVisitor<'a> = dyn FnMut(u64, &Row, Option<(u64, &Row)>) -> Result<()> + 'a;
 
@@ -396,21 +413,14 @@ pub(crate) struct SelectRows<'a> {
 
 impl<'a> SelectRows<'a> {
     pub(crate) fn new(columns: Option<&'a [String]>, options: &'a SelectOptions) -> Result<Self> {
-        Self::with_scratch(columns, options, None)
+        Self::with_slot(columns, options, ScratchSlot::default(), false)
     }
 
-    pub(crate) fn with_scratch(
-        columns: Option<&'a [String]>,
-        options: &'a SelectOptions,
-        scratch: Option<Rc<Scratch>>,
-    ) -> Result<Self> {
-        Self::with_slot(columns, options, ScratchSlot::new(scratch))
-    }
-
-    fn with_slot(
+    pub(crate) fn with_slot(
         columns: Option<&'a [String]>,
         options: &'a SelectOptions,
         scratch: ScratchSlot,
+        restore_source_order: bool,
     ) -> Result<Self> {
         let keep = options.limit.and_then(|limit| {
             if limit == 0 {
@@ -423,7 +433,9 @@ impl<'a> SelectRows<'a> {
             columns,
             options,
             matched: 0,
-            ordered: (options.group.is_empty() && !options.order.is_empty())
+            ordered: (options.group.is_empty()
+                && options.count.is_none()
+                && (!options.order.is_empty() || restore_source_order))
                 .then(|| Sorter::new(&options.order, keep, scratch.clone()))
                 .transpose()?,
             groups: (!options.group.is_empty())
@@ -444,7 +456,18 @@ impl<'a> SelectRows<'a> {
             .is_some_and(|position| self.options.limit.is_none_or(|limit| position < limit))
     }
 
+    pub(crate) fn is_saturated(&self) -> bool {
+        self.groups.is_none()
+            && self.ordered.is_none()
+            && self.options.count.is_none()
+            && self.keep.is_some_and(|keep| self.matched >= keep as u64)
+    }
+
     pub(crate) fn push(&mut self, id: u64, row: &Row) -> Result<Option<Value>> {
+        self.push_ordered(id, row, (id, 0))
+    }
+
+    fn push_ordered(&mut self, id: u64, row: &Row, order: RowOrder) -> Result<Option<Value>> {
         let position = self.matched;
         self.matched += 1;
         if self.keep == Some(0) {
@@ -452,7 +475,7 @@ impl<'a> SelectRows<'a> {
         }
         if let Some(groups) = &mut self.groups {
             groups.push(
-                id,
+                order,
                 self.options
                     .group
                     .iter()
@@ -471,7 +494,7 @@ impl<'a> SelectRows<'a> {
                 .iter()
                 .map(|(column, _)| field(id, row, column))
                 .collect();
-            sorter.push((id, keys, Value::Object(project(id, row, self.columns))))?;
+            sorter.push((order, keys, Value::Object(project(id, row, self.columns))))?;
             return Ok(None);
         }
         Ok(self
@@ -490,13 +513,13 @@ impl<'a> SelectRows<'a> {
             options.group.clear();
             options.count = None;
             let mut results =
-                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone())?;
+                SelectRows::with_slot(Some(&columns), &options, self.scratch.clone(), true)?;
             let written = groups.finish(|id, count, values| {
                 let mut row: Row = self.options.group.iter().cloned().zip(values).collect();
                 if let Some(name) = &self.options.count {
                     row.insert(name.clone(), Value::from(count));
                 }
-                if let Some(value) = results.push(id, &row)? {
+                if let Some(value) = results.push_ordered(id.0, &row, id)? {
                     emit(value)?;
                 }
                 Ok(())
@@ -551,6 +574,25 @@ pub(crate) fn order_row(
     left.0.cmp(&right.0)
 }
 
+// serde_json compares the two floating-point zeros as equal, even inside
+// arrays and objects. Preserve all other nested numeric representations.
+pub(crate) fn nested_json_key(value: &Value) -> String {
+    fn normalize(value: &mut Value) {
+        match value {
+            Value::Number(n) if n.is_f64() && n.as_f64() == Some(0.0) => {
+                *value = Value::from(0.0);
+            }
+            Value::Array(values) => values.iter_mut().for_each(normalize),
+            Value::Object(values) => values.values_mut().for_each(normalize),
+            _ => {}
+        }
+    }
+
+    let mut value = value.clone();
+    normalize(&mut value);
+    value.to_string()
+}
+
 fn order_value(a: &Value, b: &Value) -> Ordering {
     fn rank(value: &Value) -> u8 {
         match value {
@@ -566,7 +608,7 @@ fn order_value(a: &Value, b: &Value) -> Ordering {
         compare(a, b).unwrap_or_else(|| match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            _ => a.to_string().cmp(&b.to_string()),
+            _ => nested_json_key(a).cmp(&nested_json_key(b)),
         })
     })
 }
@@ -598,10 +640,23 @@ fn predicate_columns(
     validate: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     match predicate {
-        Predicate::Compare(name, ..) => validate(name),
+        Predicate::Compare(name, ..) | Predicate::IsNull(name, _) => validate(name),
         Predicate::And(terms) | Predicate::Or(terms) => terms
             .iter()
             .try_for_each(|term| predicate_columns(term, validate)),
+    }
+}
+
+fn same_scalar_value(left: &Value, right: &Value) -> bool {
+    left == right || compare(left, right) == Some(Ordering::Equal)
+}
+
+fn same_column_value(kind: &Kind, left: &Value, right: &Value) -> bool {
+    match (kind, left, right) {
+        (Kind::Vector(_), Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_scalar_value(x, y))
+        }
+        _ => same_scalar_value(left, right),
     }
 }
 
@@ -609,8 +664,12 @@ pub(crate) fn matches(predicate: &Predicate, id: u64, row: &Row) -> bool {
     match predicate {
         Predicate::And(terms) => terms.iter().all(|term| matches(term, id, row)),
         Predicate::Or(terms) => terms.iter().any(|term| matches(term, id, row)),
+        Predicate::IsNull(name, expect_null) => field(id, row, name).is_null() == *expect_null,
         Predicate::Compare(name, op, right) => {
             let left = field(id, row, name);
+            if left.is_null() || right.is_null() {
+                return false;
+            }
             let order = compare(&left, right);
             let equal = left == *right || order == Some(Ordering::Equal);
             match op {
@@ -644,7 +703,12 @@ fn inject(old: Value, op: Op, value: Value, kind: &Kind) -> Result<Value> {
             _ => {}
         }
     }
-    if let (Some(a), Some(b)) = (integer(&old), integer(&value)) {
+    let operand = if matches!(kind, Kind::Int) {
+        integral_literal(&value)
+    } else {
+        integer(&value)
+    };
+    if let (Some(a), Some(b)) = (integer(&old), operand) {
         let result = match op {
             Op::Add => a.checked_add(b),
             Op::Sub => a.checked_sub(b),
@@ -661,11 +725,24 @@ fn inject(old: Value, op: Op, value: Value, kind: &Kind) -> Result<Value> {
             _ => unreachable!(),
         };
         if !matches!(op, Op::Div) || result.is_some() {
-            let result = result.ok_or_else(|| anyhow!("integer overflow"))?;
-            return i64::try_from(result)
-                .map(Value::from)
-                .or_else(|_| u64::try_from(result).map(Value::from))
-                .context("integer overflow");
+            if let Some(result) = result {
+                if matches!(kind, Kind::Int) {
+                    return i64::try_from(result)
+                        .map(Value::from)
+                        .context("integer overflow");
+                }
+                if let Ok(number) = i64::try_from(result) {
+                    return Ok(Value::from(number));
+                }
+                if let Ok(number) = u64::try_from(result) {
+                    return Ok(Value::from(number));
+                }
+            }
+            ensure!(!matches!(kind, Kind::Int | Kind::Json), "integer overflow");
+            // FLOAT can represent finite results outside the integer range.
+            if let Some(result) = result {
+                return Ok(Value::from(result as f64));
+            }
         }
     }
     let a = old
@@ -749,17 +826,21 @@ impl Database {
         self.materialized = Some((0, bytes));
     }
 
-    fn charge_row(&mut self, row: &Row) -> Result<()> {
+    fn row_memory_size(row: &Row) -> u64 {
+        row.iter()
+            .map(|(name, value)| 96 + name.len() as u64 + crate::aggregate::value_weight(value))
+            .sum::<u64>()
+            .saturating_add(128)
+    }
+
+    fn adjust_materialized(&mut self, released: u64, added: u64) -> Result<()> {
         if let Some((used, limit)) = &mut self.materialized {
-            let size = row
-                .iter()
-                .map(|(name, value)| 96 + name.len() as u64 + crate::aggregate::value_weight(value))
-                .sum::<u64>();
-            *used = used.saturating_add(size).saturating_add(128);
+            let next = used.saturating_sub(released).saturating_add(added);
             ensure!(
-                *used <= *limit,
+                next <= *limit,
                 "materialization memory budget exceeded ({limit} bytes)"
             );
+            *used = next;
         }
         Ok(())
     }
@@ -771,7 +852,8 @@ impl Database {
         row: Row,
         offset: u64,
     ) -> Result<()> {
-        self.charge_row(&row)?;
+        let added = Self::row_memory_size(&row);
+        self.adjust_materialized(0, added)?;
         self.tables
             .get_mut(name)
             .expect("registered table exists")
@@ -836,7 +918,6 @@ impl Database {
         if let Change::Insert { row, .. } | Change::Update { row, .. } = change {
             crate::import_json::validate_row_nodes(row)?;
             crate::limits::measure(row, crate::limits::record()? - 1)?;
-            self.charge_row(row)?;
         }
         match change {
             Change::Schema { table, columns } => {
@@ -846,28 +927,54 @@ impl Database {
                 self.active_schema = Some(table.clone());
             }
             Change::Insert { table, id, row } => {
-                let table = self.table_mut(table)?;
-                ensure!(*id == table.next_id, "unexpected row ID {id}");
+                let added = Self::row_memory_size(row);
                 let next = id
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("row ID exhausted"))?;
-                table.put(*id, row.clone(), location)?;
-                table.next_id = next;
+                {
+                    let state = self.table(table)?;
+                    ensure!(*id == state.next_id, "unexpected row ID {id}");
+                }
+                self.adjust_materialized(0, added)?;
+                if let Err(error) = self.table_mut(table)?.put(*id, row.clone(), location) {
+                    let _ = self.adjust_materialized(added, 0);
+                    return Err(error);
+                }
+                self.table_mut(table)?.next_id = next;
             }
             Change::Update { table, id, row } => {
-                let table = self.table_mut(table)?;
-                ensure!(table.rows.contains_key(id), "unknown logical row ID {id}");
-                table.put(*id, row.clone(), location)?;
+                let released = self
+                    .table(table)?
+                    .rows
+                    .get(id)
+                    .map(|(old, _)| {
+                        if location.source == "pending" {
+                            0
+                        } else {
+                            Self::row_memory_size(old)
+                        }
+                    })
+                    .ok_or_else(|| anyhow!("unknown logical row ID {id}"))?;
+                let added = Self::row_memory_size(row);
+                self.adjust_materialized(released, added)?;
+                if let Err(error) = self.table_mut(table)?.put(*id, row.clone(), location) {
+                    let _ = self.adjust_materialized(added, released);
+                    return Err(error);
+                }
             }
             Change::Delete { table, id } => {
-                let table = self.table_mut(table)?;
-                let (row, _) = table
-                    .rows
-                    .remove(id)
-                    .ok_or_else(|| anyhow!("unknown logical row ID {id}"))?;
-                if let Some(key) = table.key(&row) {
-                    table.keys.remove(&key);
-                }
+                let (row, _) = {
+                    let table = self.table_mut(table)?;
+                    let (row, location) = table
+                        .rows
+                        .remove(id)
+                        .ok_or_else(|| anyhow!("unknown logical row ID {id}"))?;
+                    if let Some(key) = table.key(&row) {
+                        table.keys.remove(&key);
+                    }
+                    (row, location)
+                };
+                let _ = self.adjust_materialized(Self::row_memory_size(&row), 0);
             }
         }
         Ok(())
@@ -882,13 +989,14 @@ impl Database {
         right_rows: impl IntoIterator<Item = (u64, R)>,
         scan_left: impl FnOnce(&mut dyn FnMut(u64, &Row) -> Result<()>) -> Result<()>,
         emit: impl FnMut(Value) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<ResultSpill> {
         self.join_with_pairs(
             table,
             columns,
             predicate,
             options,
             None,
+            false,
             |left_key, right_key, visit| {
                 let join = options.join.as_ref().expect("JOIN options are present");
                 let mut index: BTreeMap<SqlKey, Vec<_>> = BTreeMap::new();
@@ -912,7 +1020,6 @@ impl Database {
             },
             emit,
         )
-        .map(|_| ())
     }
 
     pub(crate) fn join_with_pairs(
@@ -922,6 +1029,7 @@ impl Database {
         predicate: Option<&Predicate>,
         options: &SelectOptions,
         scratch: Option<Rc<Scratch>>,
+        restore_source_order: bool,
         pairs: impl FnOnce(&str, &str, &mut JoinVisitor<'_>) -> Result<()>,
         mut emit: impl FnMut(Value) -> Result<()>,
     ) -> Result<ResultSpill> {
@@ -965,7 +1073,9 @@ impl Database {
         ] {
             for &name in fields {
                 let full = format!("{alias}.{name}");
-                qualified.push(full.clone());
+                if name != "_line" {
+                    qualified.push(full.clone());
+                }
                 bindings.push((full, from_left, name));
                 if !other.contains(&name) {
                     bindings.push((name.to_owned(), from_left, name));
@@ -1013,7 +1123,12 @@ impl Database {
         }
         let projection =
             columns.or_else(|| options.count.is_none().then_some(qualified.as_slice()));
-        let mut results = SelectRows::with_scratch(projection, options, scratch)?;
+        let mut results = SelectRows::with_slot(
+            projection,
+            options,
+            ScratchSlot::new(scratch),
+            restore_source_order,
+        )?;
         let mut sequence = 0;
         pairs(left_key, right_key, &mut |left_id, left_row, hit| {
             sequence += 1;
@@ -1029,7 +1144,8 @@ impl Database {
                 })
                 .collect();
             if predicate.is_none_or(|filter| matches(filter, sequence, &row))
-                && let Some(value) = results.push(sequence, &row)?
+                && let Some(value) =
+                    results.push_ordered(sequence, &row, (left_id, hit.map_or(0, |(id, _)| id)))?
             {
                 emit(value)?;
             }
@@ -1042,11 +1158,18 @@ impl Database {
         &mut self,
         statement: Statement,
         location: Location,
-    ) -> Result<(Vec<Change>, Vec<Value>)> {
+    ) -> Result<(Vec<Change>, Vec<Value>, ResultSpill)> {
         let mut output = Vec::new();
+        let mut spill = ResultSpill::default();
         let changes = match statement {
             Statement::ExplainAnalyze(_) => bail!("EXPLAIN ANALYZE requires a database query"),
             Statement::Schema(table, columns) => vec![Change::Schema { table, columns }],
+            Statement::Row(Value::Object(row)) if location.source == "script" => {
+                let (table, id, _) = self.register_base_row(&row, true, false)?;
+                let table = table.to_owned();
+                self.retain_base_row(&table, id, row, location.offset)?;
+                Vec::new()
+            }
             Statement::Row(Value::Object(row)) => {
                 let table = self
                     .active_schema
@@ -1119,7 +1242,7 @@ impl Database {
                             row.insert(column.name.clone(), value.clone());
                         }
                         Some(existing) => ensure!(
-                            keep_target || existing == value,
+                            keep_target || same_column_value(&column.kind, existing, value),
                             "FUSE conflict in column {}",
                             column.name
                         ),
@@ -1150,10 +1273,11 @@ impl Database {
                     matches!(definition.kind, Kind::Float | Kind::Vector(_)),
                     "DECAY requires a FLOAT or VECTOR column"
                 );
+                let kind = definition.kind.clone();
                 let ids = state.matching(predicate.as_ref())?;
                 let mut changes = Vec::new();
                 for id in ids {
-                    let (row, _) = &state.rows[&id];
+                    let (row, _) = &self.table(&table)?.rows[&id];
                     let Some(value) = row
                         .get(&column)
                         .filter(|value| !value.is_null() && factor != 1.0)
@@ -1162,23 +1286,28 @@ impl Database {
                     };
                     let scale = |value: &Value| {
                         let number = value.as_f64().expect("validated numeric value");
-                        Value::from(number * factor)
+                        let scaled = number * factor;
+                        Value::from(if scaled == 0.0 { 0.0 } else { scaled })
                     };
                     let updated = match value {
                         Value::Array(values) => Value::Array(values.iter().map(scale).collect()),
                         value => scale(value),
                     };
-                    if updated != *value {
+                    if !same_column_value(&kind, &updated, value) {
                         let mut row = row.clone();
                         row.insert(column.clone(), updated);
-                        changes.push(Change::Update {
+                        let change = Change::Update {
                             table: table.clone(),
                             id,
                             row,
-                        });
+                        };
+                        self.apply(&change, location)?;
+                        if location.source != "script" {
+                            changes.push(change);
+                        }
                     }
                 }
-                changes
+                return Ok((changes, output, spill));
             }
             Statement::Resonate {
                 table,
@@ -1200,8 +1329,12 @@ impl Database {
                     anyhow!("RESONATE requires a nonzero VECTOR({dimension}) query")
                 })?;
                 let mut scores = Vec::new();
-                for id in state.matching(predicate.as_ref())? {
-                    let (row, _) = &state.rows[&id];
+                let best_first = |(ai, a): &(u64, f64), (bi, b): &(u64, f64)| {
+                    b.partial_cmp(a)
+                        .expect("finite cosine score")
+                        .then_with(|| ai.cmp(bi))
+                };
+                state.visit_matches(predicate.as_ref(), |id, row| {
                     if let Some(vector) = row
                         .get(&column)
                         .and_then(|value| unit_vector(value, dimension))
@@ -1213,19 +1346,21 @@ impl Database {
                             .sum::<f64>()
                             .clamp(-1.0, 1.0);
                         scores.push((id, score));
+                        if scores.len() > limit.saturating_mul(2) {
+                            scores.select_nth_unstable_by(limit, best_first);
+                            scores.truncate(limit);
+                        }
                     }
+                    Ok(())
+                })?;
+                scores.sort_unstable_by(best_first);
+                let result_limit = crate::limits::materialized()?;
+                let mut result_bytes = 0;
+                for (id, score) in scores.into_iter().take(limit) {
+                    let row = serde_json::json!({ "_line": id, "_score": score });
+                    crate::limits::charge_result(&mut result_bytes, result_limit, &row)?;
+                    output.push(row);
                 }
-                scores.sort_unstable_by(|(a_id, a), (b_id, b)| {
-                    b.partial_cmp(a)
-                        .expect("cosine scores are finite")
-                        .then_with(|| a_id.cmp(b_id))
-                });
-                output.extend(
-                    scores
-                        .into_iter()
-                        .take(limit)
-                        .map(|(id, score)| serde_json::json!({ "_line": id, "_score": score })),
-                );
                 Vec::new()
             }
             Statement::Select(table, columns, predicate, options) => {
@@ -1234,7 +1369,7 @@ impl Database {
                 if let Some(join) = &options.join {
                     let left = self.table(&table)?;
                     let right = self.table(&join.table)?;
-                    self.join_rows(
+                    spill = self.join_rows(
                         &table,
                         columns.as_deref(),
                         predicate.as_ref(),
@@ -1252,20 +1387,20 @@ impl Database {
                             Ok(())
                         },
                     )?;
-                    return Ok((Vec::new(), output));
+                    return Ok((Vec::new(), output, spill));
                 }
                 self.validate_select(&table, columns.as_deref(), predicate.as_ref())?;
                 self.validate_group_order(&table, &options)?;
                 let state = self.table(&table)?;
                 let mut results = SelectRows::new(columns.as_deref(), &options)?;
-                for id in state.matching(predicate.as_ref())? {
-                    let (row, _) = &state.rows[&id];
+                state.visit_matches(predicate.as_ref(), |id, row| {
                     if let Some(value) = results.push(id, row)? {
                         crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;
                         output.push(value);
                     }
-                }
-                results.finish_with(&mut |value| {
+                    Ok(())
+                })?;
+                spill = results.finish_with(&mut |value| {
                     crate::limits::charge_result(&mut result_bytes, result_limit, &value)?;
                     output.push(value);
                     Ok(())
@@ -1279,19 +1414,22 @@ impl Database {
                     ensure!(state.has_column(name), "unknown column {name}");
                     ensure!(seen.insert(name), "duplicate assignment {name}");
                 }
-                state
-                    .matching(predicate.as_ref())?
-                    .into_iter()
-                    .map(|id| {
-                        let mut row = state.rows[&id].0.clone();
-                        row.extend(assignments.iter().cloned());
-                        Change::Update {
-                            table: table.clone(),
-                            id,
-                            row,
-                        }
-                    })
-                    .collect()
+                let ids = state.matching(predicate.as_ref())?;
+                let mut changes = Vec::new();
+                for id in ids {
+                    let mut row = self.table(&table)?.rows[&id].0.clone();
+                    row.extend(assignments.iter().cloned());
+                    let change = Change::Update {
+                        table: table.clone(),
+                        id,
+                        row,
+                    };
+                    self.apply(&change, location)?;
+                    if location.source != "script" {
+                        changes.push(change);
+                    }
+                }
+                return Ok((changes, output, spill));
             }
             Statement::Delete(table, predicate) => self
                 .table(&table)?
@@ -1322,6 +1460,20 @@ impl Database {
         for change in &changes {
             self.apply(change, location)?;
         }
-        Ok((changes, output))
+        Ok((changes, output, spill))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integral_literal_rejects_out_of_range_floats() {
+        assert_eq!(integral_literal(&serde_json::json!(1e40)), None);
+        assert_eq!(integral_literal(&serde_json::json!(-1e40)), None);
+        assert_eq!(integral_literal(&serde_json::json!(42.0)), Some(42));
+        assert_eq!(integral_literal(&serde_json::json!(-0.0)), Some(0));
+        assert_eq!(integral_literal(&serde_json::json!(1.5)), None);
     }
 }

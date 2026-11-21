@@ -71,6 +71,8 @@ jsqnl exec users.jsqnl 'EXPLAIN ANALYZE SELECT name FROM users WHERE id = 2;'
 
 `jsqnl scan PARQUET_DIRECTORY 'SELECT ...;'` は、指定ディレクトリ直下の全Parquetファイルをファイル名順に読みます。対象テーブル名はディレクトリ名で、末尾が `data` の場合は親ディレクトリ名です。クエリは既存のJSQNLの `SELECT` を1文受け付け、WHEREの条件と列選択を順に適用します。必要列だけを読み、結果はJSONLで逐次出力します。対象は同一のArrowスキーマを持つシャードです。
 
+ディレクトリ名や列名にハイフン・空白・日本語がある場合は、`SELECT "年度" FROM "my-data"` のように二重引用符で囲みます。
+
 Parquetの読み取りにはPyArrowが必要です。既定の `python3` で利用できるようにするか、`JSQNL_PYTHON` にインストール済みのPythonを指定してください。
 
 ```sh
@@ -99,7 +101,7 @@ INJECT age FROM users THE 1 WHO + 2;
 - 型は `INT`（符号付き64ビット整数）、`FLOAT`（JSON数値）、`TEXT`、`BOOL`、`JSON`、`VECTOR(n)` です。未宣言の列、重複する列宣言、空のスキーマを拒否します。各テーブルに `INT` または `TEXT` の `PRIMARY KEY` を1列まで指定できます。`NOT NULL` と主キーの省略・nullはエラーです。その他の列の省略はWHEREと明示的な列選択でnullとして評価されます。`SELECT *` は保存済みのフィールドを返します。
 - SQL文はセミコロンで終了します。キーワードと型名の大文字・小文字は区別しません。識別子はASCIIの英字またはアンダースコアから始まり、英数字とアンダースコアを使用できます。識別子の大文字・小文字は区別します。文字列にはJSONの二重引用符、またはSQL式の単一引用符と `''` エスケープを使えます。
 - INSERTは `VALUES (値, ...)` または列リストを省略した `VALUES {JSONオブジェクト}` を受け付けます。位置指定で列リストを省略するとスキーマの宣言順を使います。UPDATEの代入値とWHEREの比較右辺はリテラルです。
-- WHEREは `=`、`!=`、`<>`、`<`、`<=`、`>`、`>=`、`AND`、`OR`、括弧に対応します。数値同士、文字列同士を大小比較できます。等値比較はJSON値に対して行い、`col = NULL` で欠損またはnullを検索できます。ANDがORより先に評価されます。WHEREを省略したUPDATE・DELETEは全件に作用します。SELECT結果は論理IDの昇順です。
+- WHEREは `=`、`!=`、`<>`、`<`、`<=`、`>`、`>=`、`AND`、`OR`、括弧に対応します。数値同士、文字列同士を大小比較できます。欠損またはnullを検索するには `col IS NULL` を使います。通常の比較演算子で欠損やnullを比較した行はWHEREに一致しません。ANDがORより先に評価されます。WHEREを省略したUPDATE・DELETEは全件に作用します。SELECT結果は論理IDの昇順です。
 
 ### 検索件数と並べ替え
 
@@ -108,7 +110,7 @@ SELECT name FROM users WHERE age BETWEEN 18 AND 25 ORDER BY age DESC, name ASC L
 SELECT COUNT(*) AS total FROM users WHERE age IS NOT NULL;
 ```
 
-`SELECT` は複数列の `ORDER BY`、`ASC` / `DESC`、`LIMIT`、`OFFSET` と `COUNT(*) [AS 名前]` に対応します。並べ替えの同点は論理ID順です。昇順ではnullが先で、降順では後です。WHEREには `IS NULL`、`IS NOT NULL`、`BETWEEN`、`IN` も書けます。nullの等値比較は従来のJSQNLに従います。同じ構文をParquetの `scan` にも使えます。並べ替えに `LIMIT` を付けると候補の保持数は `OFFSET + LIMIT` の約2倍までに抑えられます。並べ替えがメモリ予算を超えると、ソート済みの小さな一時ファイルに分け、最大8本ずつマージします。
+`SELECT` は複数列の `ORDER BY`、`ASC` / `DESC`、`LIMIT`、`OFFSET` と `COUNT(*) [AS 名前]` に対応します。並べ替えの同点は論理ID順です。昇順ではnullが先で、降順では後です。WHEREには `IS NULL`、`IS NOT NULL`、`BETWEEN`、`IN` も書けます。同じ構文をParquetの `scan` にも使えます。並べ替えに `LIMIT` を付けると候補の保持数は `OFFSET + LIMIT` の約2倍までに抑えられます。並べ替えがメモリ予算を超えると、ソート済みの小さな一時ファイルに分け、最大8本ずつマージします。
 
 ### 結合とグループ集計
 
@@ -170,7 +172,7 @@ jsqnl exec db.jsqnl 'SELECT * FROM users WHERE id = 2;'
 
 `disk-index` は更新ログが空または存在しないDBを逐次検証し、テーブル・論理ID・主キーからバイトオフセットを引けるSQLiteファイル `db.jsqnl.seek.sqlite` を作ります。単独のSELECTで `_line` または主キーを等値指定すると、ファイルの状態が索引作成時と一致する場合に該当行へ直接移動します。ANDで併記した条件に対しても、取得した行のWHERE全体を評価します。WHEREなしの `COUNT(*)` も、データ行を開かず索引から求めます。バッファは256 KiBで行を逐次読み込み、索引構築はSQLiteのページキャッシュを64 MiBに設定します。
 
-新しい索引には `.seek.sqlite.seal` が付きます。通常のクエリはベースと索引ファイルの指紋を照合します。索引が変更された場合、シールがない旧索引の場合、元ファイルを変更・移動した場合は、逐次走査に戻ります。`check` はログのないDBについて索引のSHA-256まで読み取って確認し、`disk_index` に状態を出力します。`disk-index` で索引とシールを再生成できます。シールは破損検出用で、外部から渡された索引の認証には使えません。更新ログがあるDBは従来どおり更新を再生します。`index` が出力するJSONの診断用索引も利用できます。
+新しい索引には `.seek.sqlite.seal` が付きます。通常のクエリはベースと索引ファイルの指紋を照合します。索引が変更された場合、シールがない場合（`unsealed`）、最大行サイズが記録されていない旧索引の場合（`legacy`）、元ファイルを変更・移動した場合は、逐次走査に戻ります。`check` はログのないDBについて索引のSHA-256まで読み取って確認し、`disk_index` に状態を出力します。`disk-index` で索引とシールを再生成できます。シールは破損検出用で、外部から渡された索引の認証には使えません。更新ログがあるDBは従来どおり更新を再生します。`index` が出力するJSONの診断用索引も利用できます。
 
 ### ファイルの取り扱い
 
@@ -190,7 +192,7 @@ RESONATE embedding FROM users WITH [1,0,0] WHERE age >= 18 LIMIT 5;
 
 ## 外部ハッシュ集計と一時領域
 
-GROUP BYは集計キーごとの状態をHashMapに保持し、推定メモリが既定の16 MiBを超えると256個のディスクパーティションに退避します。1パーティションずつ集計し、偏りでメモリ予算を超えるパーティションは一時SQLite集計に切り替えます。グループ数が多い場合も、ORDER BYなしなら結果を逐次出力します。ORDER BYはメモリ予算を超えると外部ソートを使います。LIMITを指定すると、必要な上位候補だけを残せます。集計の予算は `JSQNL_GROUP_MEMORY_BYTES` で変更できます。予算は推定ヒープ使用量で、プロセスのRSS上限ではありません。
+GROUP BYは集計キーごとの状態をHashMapに保持し、推定メモリが既定の16 MiBを超えると256個のディスクパーティションに退避します。1パーティションずつ集計し、偏りでメモリ予算を超えるパーティションは一時SQLite集計に切り替えます。ORDER BYを省略した集計結果は、各グループが元データに最初に現れた順に並びます。並べ替えは集計完了後に行います。ORDER BYはメモリ予算を超えると外部ソートを使います。LIMITを指定すると、必要な上位候補だけを残せます。集計の予算は `JSQNL_GROUP_MEMORY_BYTES` で変更できます。予算は推定ヒープ使用量で、プロセスのRSS上限ではありません。
 
 集計とGrace Hash Joinの一時データは、`TMPDIR` 内の利用者専用レジストリにクエリ単位で保存されます。CLI起動時および一時領域の確保時に、OSロックが解放されたディレクトリだけを回収します。Rustからは `jsqnl::recover_temporary_files()` を呼べます。クエリごとの一時容量は `JSQNL_TEMP_LIMIT_BYTES` で指定でき、既定は8 GiBです。集計とJOINを同時に行うクエリでは同じ予算を共有します。複数クエリの合計容量は各クエリの上限の合計まで増え得ます。
 
@@ -222,3 +224,4 @@ jsqnl exec experiment/users.jsqnl 'SELECT _line, name FROM users;'
 JSQNLは[MITライセンス](../../LICENSE)で提供しています。法人の利用や商用利用にも、MITライセンスの条件が適用されます。
 
 法人向けの導入支援・保守・個別契約をご希望の場合は、開発元までご相談ください。
+
