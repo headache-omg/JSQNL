@@ -103,8 +103,10 @@ fn recover_locked(root: &Path) -> Result<usize> {
         }
         let path = entry.path();
         // Drop may already have removed this directory. Never inspect a replacement link.
-        if !path.try_exists()? {
-            continue;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
         validate_directory(&path)?;
         let lock = match open_lock(&path.join("active.lock")) {
@@ -147,7 +149,7 @@ pub(crate) fn recover() -> Result<usize> {
 pub(crate) struct Scratch {
     path: PathBuf,
     root: PathBuf,
-    _active: File,
+    active: Option<File>,
     limit: u64,
     used: Cell<u64>,
 }
@@ -171,15 +173,25 @@ impl Scratch {
         let count = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = root.join(format!("q-{}-{time}-{count}", std::process::id()));
         private_directory(&path)?;
-        let active = private_options()
-            .read(true)
-            .create_new(true)
-            .open(path.join("active.lock"))?;
-        active.lock()?;
+        let active = (|| -> Result<File> {
+            let active = private_options()
+                .read(true)
+                .create_new(true)
+                .open(path.join("active.lock"))?;
+            active.lock()?;
+            Ok(active)
+        })();
+        let active = match active {
+            Ok(active) => active,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&path);
+                return Err(error);
+            }
+        };
         Ok(Self {
             path,
             root,
-            _active: active,
+            active: Some(active),
             limit,
             used: Cell::new(0),
         })
@@ -228,7 +240,9 @@ impl Scratch {
             "temporary storage quota exceeded (limit {} bytes)",
             self.limit
         );
-        let connection = Connection::open(self.path(name))?;
+        let path = self.path(name);
+        private_options().create_new(true).open(&path)?;
+        let connection = Connection::open(&path)?;
         connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-4096; PRAGMA page_size=4096;")?;
         connection.pragma_update(None, "max_page_count", remaining / 4096)?;
         Ok(connection)
@@ -237,8 +251,10 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // Serialize removal with the scavenger, including removal of the lock file.
+        // Serialize removal with the scavenger, releasing the active lock before removal
+        // so Windows can delete the directory cleanly while the registry gate is held.
         if let Ok(_gate) = gate(&self.root) {
+            self.active.take();
             let _ = fs::remove_dir_all(&self.path);
         }
     }
@@ -307,13 +323,26 @@ impl KeyValidation {
 }
 
 /// Buffer each partition in memory and open it only for the duration of a flush.
-#[derive(Default)]
 pub(crate) struct PartitionWriters {
     buffers: std::collections::HashMap<PathBuf, Vec<u8>>,
+    buffer_size: usize,
+}
+
+impl Default for PartitionWriters {
+    fn default() -> Self {
+        Self::with_buffer(Self::DEFAULT_BUFFER)
+    }
 }
 
 impl PartitionWriters {
-    const BUFFER: usize = 32 * 1024;
+    const DEFAULT_BUFFER: usize = 32 * 1024;
+
+    pub(crate) fn with_buffer(buffer_size: usize) -> Self {
+        Self {
+            buffers: std::collections::HashMap::new(),
+            buffer_size: buffer_size.max(512),
+        }
+    }
 
     fn open(path: &Path) -> Result<File> {
         Ok(private_options().append(true).create(true).open(path)?)
@@ -330,15 +359,16 @@ impl PartitionWriters {
 
     pub(crate) fn append(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
+        let buffer_size = self.buffer_size;
         let buffer = if let Some(buffer) = self.buffers.get_mut(path) {
             buffer
         } else {
             self.buffers.entry(path.to_owned()).or_default()
         };
-        if buffer.len() + bytes.len() + 1 > Self::BUFFER {
+        if buffer.len() + bytes.len() + 1 > buffer_size {
             Self::flush(path, buffer)?;
         }
-        if bytes.len() >= Self::BUFFER {
+        if bytes.len() >= buffer_size {
             let mut file = Self::open(path)?;
             file.write_all(bytes)?;
             file.write_all(b"\n")?;

@@ -38,7 +38,7 @@ The supported types are `INT` (signed 64-bit), `FLOAT`, `TEXT`, `BOOL`, `JSON`, 
 
 ## Queries and updates
 
-Filter with `WHERE`, `IN`, `BETWEEN`, and `IS NULL`. Use `ORDER BY`, `LIMIT`, and `OFFSET` for ordered pages, and `GROUP BY` with `COUNT(*)` for counts. `INNER JOIN` and `LEFT JOIN` match one qualified column from each of two tables in the same database.
+Filter with `WHERE`, `IN`, and `BETWEEN`. Use `IS NULL` to match missing or null values. Ordinary comparisons involving a missing or null value do not match. Use `ORDER BY`, `LIMIT`, and `OFFSET` for ordered pages, and `GROUP BY` with `COUNT(*)` for counts. `INNER JOIN` and `LEFT JOIN` match one qualified column from each of two tables in the same database.
 
 ```sql
 SELECT name FROM users WHERE age BETWEEN 18 AND 25 ORDER BY age DESC LIMIT 5;

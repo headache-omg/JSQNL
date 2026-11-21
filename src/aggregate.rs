@@ -63,6 +63,9 @@ fn merge(groups: &mut Groups, bytes: &mut u64, key: String, value: Partial) {
         std::collections::hash_map::Entry::Occupied(mut slot) => {
             let existing = slot.get_mut();
             if value.id < existing.id {
+                let old_weight: u64 = existing.values.iter().map(value_weight).sum();
+                let new_weight: u64 = value.values.iter().map(value_weight).sum();
+                *bytes = bytes.saturating_sub(old_weight).saturating_add(new_weight);
                 *existing = Partial {
                     count: value.count + existing.count,
                     ..value
@@ -74,9 +77,13 @@ fn merge(groups: &mut Groups, bytes: &mut u64, key: String, value: Partial) {
     }
 }
 
-fn read(input: &mut impl BufRead, line: &mut String) -> Result<Option<(String, Partial)>> {
+fn read(
+    input: &mut impl BufRead,
+    line: &mut String,
+    frame_limit: u64,
+) -> Result<Option<(String, Partial)>> {
     line.clear();
-    if input.read_line(line)? == 0 {
+    if crate::limits::line(input, line, frame_limit)? == 0 {
         return Ok(None);
     }
     Ok(Some(crate::internal_json::decode(line.as_bytes())?))
@@ -100,21 +107,30 @@ struct Spill {
     hash: RandomState,
     partitions: PartitionWriters,
     bytes: [u64; PARTITIONS],
+    frame_limit: u64,
 }
 
 impl Spill {
-    fn new(root: Rc<Scratch>) -> Self {
+    fn new(root: Rc<Scratch>, budget: u64, frame_limit: u64) -> Self {
+        let buffer_size = usize::try_from(budget / (PARTITIONS as u64 * 2))
+            .unwrap_or(32 * 1024)
+            .clamp(512, 32 * 1024);
         Self {
             root,
             hash: RandomState::new(),
-            partitions: PartitionWriters::default(),
+            partitions: PartitionWriters::with_buffer(buffer_size),
             bytes: [0; PARTITIONS],
+            frame_limit,
         }
     }
 
     fn write(&mut self, key: String, group: Partial) -> Result<()> {
         let bucket = self.hash.hash_one(&key) as usize % PARTITIONS;
-        let encoded = serde_json::to_vec(&(key, group))?;
+        let encoded = crate::limits::encode_with(
+            &(key, group),
+            self.frame_limit - 1,
+            "aggregation record exceeds byte limit",
+        )?;
         let size = encoded.len() as u64 + 1;
         self.root.account(size)?;
         self.partitions
@@ -152,7 +168,7 @@ impl Spill {
         let mut line = String::new();
         let mut groups = Groups::new();
         let mut bytes = 0;
-        while let Some((key, group)) = read(&mut input, &mut line)? {
+        while let Some((key, group)) = read(&mut input, &mut line, self.frame_limit)? {
             merge(&mut groups, &mut bytes, key, group);
             if bytes > budget {
                 return self.reduce_disk(groups, &mut input, &mut line, emit);
@@ -182,7 +198,7 @@ impl Spill {
             for (key, group) in groups {
                 upsert(&mut insert, key, group)?;
             }
-            while let Some((key, group)) = read(input, line)? {
+            while let Some((key, group)) = read(input, line, self.frame_limit)? {
                 upsert(&mut insert, key, group)?;
             }
         }
@@ -212,6 +228,7 @@ pub(crate) struct Aggregation {
     groups: Groups,
     bytes: u64,
     budget: u64,
+    frame_limit: u64,
     root: ScratchSlot,
     spill: Option<Spill>,
 }
@@ -222,6 +239,7 @@ impl Aggregation {
             groups: Groups::new(),
             bytes: 0,
             budget: configured_bytes("JSQNL_GROUP_MEMORY_BYTES", DEFAULT_BUDGET)?,
+            frame_limit: crate::limits::frame()?,
             root,
             spill: None,
         })
@@ -239,7 +257,7 @@ impl Aggregation {
         }
         merge(&mut self.groups, &mut self.bytes, key, group);
         if self.bytes > self.budget {
-            let mut spill = Spill::new(self.root.get()?);
+            let mut spill = Spill::new(self.root.get()?, self.budget, self.frame_limit);
             for (key, group) in std::mem::take(&mut self.groups) {
                 spill.write(key, group)?;
             }

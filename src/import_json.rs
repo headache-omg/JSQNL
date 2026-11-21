@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use std::cell::Cell;
 use std::fmt;
 
-const NODE_LIMIT: usize = 262_144;
+pub(crate) const NODE_LIMIT: usize = 262_144;
 
 pub(crate) struct StrictValue(pub Value);
 
@@ -79,7 +79,11 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value with unique object member names")
+        if self.strict {
+            formatter.write_str("a JSON value with unique object member names")
+        } else {
+            formatter.write_str("a JSON value")
+        }
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Value, E> {

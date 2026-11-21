@@ -1,7 +1,7 @@
 use crate::engine::{Change, Database, Location, Row, SelectRows, matches, select_references};
 use crate::plan::{AccessPath, BasePlan, QueryReport};
 use crate::scratch::{KeyValidation, ScratchSlot, configured_bytes};
-use crate::syntax::{Column, Statement, parse, validate_version_line};
+use crate::syntax::{Column, Statement, parse_line, validate_version_line};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: u32 = 1;
@@ -145,6 +146,10 @@ struct Store {
 impl Store {
     fn open(path: &Path) -> Result<Self> {
         let (path, base) = locked_base(path)?;
+        Self::open_locked(path, base)
+    }
+
+    fn open_locked(path: PathBuf, mut base: File) -> Result<Self> {
         let key = crate::journal_auth::JournalKey::load()?;
         let limit = crate::limits::materialized()?;
         let (committed, tail) = journal_lengths(&path)?;
@@ -152,6 +157,7 @@ impl Store {
             base.metadata()?.len().saturating_add(committed) <= limit,
             "database and journal exceed the materialization byte limit ({limit})"
         );
+        base.seek(SeekFrom::Start(0))?;
         let mut hash = Sha256::new();
         let (db, base_rows, base_bytes) = walk_base(
             &path,
@@ -324,9 +330,14 @@ impl Store {
     }
 
     fn write_index(&self, index: &Value) -> Result<()> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let path = sidecar(&self.path, ".idx");
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let temp = sidecar(&path, &format!(".{}.{nonce}.tmp", std::process::id()));
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = sidecar(
+            &path,
+            &format!(".{}.{nonce}.{sequence}.tmp", std::process::id()),
+        );
         let mut file = private_options().create_new(true).open(&temp)?;
         let result = (|| -> Result<()> {
             serde_json::to_writer(&mut file, index)?;
@@ -419,15 +430,20 @@ pub(crate) fn walk_base(
             path.display()
         );
         on_line(&line);
-        let content = if line_number == 1 {
-            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        let (bom_len, without_bom) = if line_number == 1
+            && let Some(stripped) = line.strip_prefix('\u{feff}')
+        {
+            ('\u{feff}'.len_utf8(), stripped)
         } else {
-            &line
+            (0, line.as_str())
         };
-        let content = content.trim_start();
-        let record_offset = offset + (line.len() - content.len()) as u64;
+        let raw = without_bom.strip_suffix('\n').unwrap_or(without_bom);
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let content = raw.trim_start();
+        let record_offset = offset + (bom_len + (raw.len() - content.len())) as u64;
         let content = content.trim_end();
         (|| -> Result<()> {
+            ensure!(!raw.contains('\r'), "invalid physical line");
             if content.starts_with('{') {
                 let row = crate::import_json::bounded_row(content)
                     .context("JSONL requires one object per physical line")?;
@@ -445,7 +461,7 @@ pub(crate) fn walk_base(
             } else {
                 ensure!(!content.starts_with('\u{feff}'), "unexpected UTF-8 BOM");
                 validate_version_line(content, line_number == 1)?;
-                for (_, statement) in parse(content)? {
+                for (_, statement) in parse_line(content, line_number == 1)? {
                     let Statement::Schema(name, columns) = statement else {
                         bail!("use 'run' for mixed scripts, or 'exec' for SQL against a database");
                     };
@@ -486,30 +502,50 @@ pub(crate) fn query(
             return Ok(report);
         }
     }
+    let mut locked = None;
     if let [(_, Statement::Select(table, columns, predicate, options))] = statements.as_slice() {
-        let (path, mut base) = locked_base(path)?;
-        if !has_log(&path)? {
+        let (snapshot_path, mut base) = locked_base(path)?;
+        if !has_log(&snapshot_path)? {
+            let _ = crate::journal_auth::JournalKey::load()?;
             let validate = |db: &Database| {
                 db.validate_select(table, columns.as_deref(), predicate.as_ref())?;
                 db.validate_group_order(table, options)
             };
-            let plan =
-                BasePlan::prepare(&path, &base, table, predicate.as_ref(), options, validate)?;
+            let plan = BasePlan::prepare(
+                &snapshot_path,
+                &base,
+                table,
+                predicate.as_ref(),
+                options,
+                validate,
+            )?;
             // JSQNL mutations only append to the journal. The open base handle is
             // a read-only snapshot, so the caller may reenter after planning.
             base.unlock().context("unlocking the read-only snapshot")?;
             let scratch = ScratchSlot::default();
-            let validate_on_disk = matches!(
+            let validate_on_disk = if matches!(
                 plan,
                 BasePlan::Scan {
                     indexed_validation: false
                 }
-            ) && !options.group.is_empty()
-                && base.metadata()?.len()
-                    > configured_bytes(
+            ) {
+                let mut threshold = crate::aggregate::DEFAULT_BUDGET;
+                if !options.group.is_empty() {
+                    threshold = threshold.min(configured_bytes(
                         "JSQNL_GROUP_MEMORY_BYTES",
                         crate::aggregate::DEFAULT_BUDGET,
-                    )?;
+                    )?);
+                }
+                if !options.order.is_empty() {
+                    threshold = threshold.min(configured_bytes(
+                        "JSQNL_SORT_MEMORY_BYTES",
+                        crate::aggregate::DEFAULT_BUDGET,
+                    )?);
+                }
+                base.metadata()?.len() > threshold
+            } else {
+                false
+            };
             let mut key_validation = validate_on_disk.then(|| KeyValidation::new(scratch.clone()));
             let mut validation_bytes = 0;
             let mut results = SelectRows::with_slot(columns.as_deref(), options, scratch, false)?;
@@ -547,7 +583,7 @@ pub(crate) fn query(
                 }
                 BasePlan::Scan { indexed_validation } => {
                     let (db, rows, bytes) = walk_base(
-                        &path,
+                        &snapshot_path,
                         &base,
                         if indexed_validation {
                             BaseRead::Indexed
@@ -584,7 +620,7 @@ pub(crate) fn query(
                     budget,
                 } => {
                     let stats = crate::grace_join::execute(
-                        &path,
+                        &snapshot_path,
                         &base,
                         indexed_validation,
                         budget,
@@ -596,8 +632,8 @@ pub(crate) fn query(
                     )?;
                     let mut report = QueryReport {
                         rows_read: stats.rows,
-                        base_bytes_read: stats.bytes,
                         spill_bytes_written: Some(stats.spill_bytes),
+                        base_bytes_read: stats.bytes,
                         oversized_partitions: Some(stats.skew_partitions),
                         ..QueryReport::new(AccessPath::GraceHashJoin, &statements)
                     };
@@ -630,7 +666,7 @@ pub(crate) fn query(
                     let mut right = Vec::new();
                     let mut left_range: Option<(u64, u64)> = None;
                     let (db, rows, bytes) = walk_base(
-                        &path,
+                        &snapshot_path,
                         &base,
                         if indexed_validation {
                             BaseRead::Indexed
@@ -711,10 +747,14 @@ pub(crate) fn query(
             report.record_spill(spilled);
             return Ok(report);
         }
+        locked = Some((snapshot_path, base));
     }
 
     let mut report = QueryReport::new(AccessPath::Materialized, &statements);
-    let mut store = Store::open(path)?;
+    let mut store = match locked {
+        Some((snapshot_path, base)) => Store::open_locked(snapshot_path, base)?,
+        None => Store::open(path)?,
+    };
     report.base_bytes_read = store.base_bytes;
     report.rows_read = store.base_rows;
     report.journal_bytes_read = store.log_end + store.uncommitted_bytes;
@@ -737,10 +777,10 @@ pub(crate) fn query(
     if !changes.is_empty() {
         store.commit(changes)?;
         if let Err(error) = store.write_index(&store.index()) {
-            eprintln!(
-                "jsqnl: transaction saved, index refresh failed: {}",
+            report.warnings.push(format!(
+                "transaction saved, index refresh failed: {}",
                 crate::terminal_diagnostic(&error)
-            );
+            ));
         }
     }
     drop(store);
@@ -783,19 +823,28 @@ fn validate_base(
     Ok(db)
 }
 
+fn read_saved_index(index_path: &Path) -> Result<(Option<Value>, &'static str)> {
+    let limit = crate::limits::materialized()?.saturating_mul(2);
+    match open_regular(index_path) {
+        Ok(file) => {
+            let Ok(bytes) = crate::limits::read_bytes(file, limit, "index exceeds byte limit")
+            else {
+                return Ok((None, "invalid"));
+            };
+            match crate::internal_json::decode::<Value>(&bytes) {
+                Ok(saved) => Ok((Some(saved), "current")),
+                Err(_) => Ok((None, "invalid")),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((None, "missing")),
+        Err(error) => Err(error).with_context(|| format!("reading {}", index_path.display())),
+    }
+}
+
 fn check_base(path: &Path, base: &File, tail: u64) -> Result<Value> {
     let disk_status = crate::disk_index::check(path, base)?;
     let index_path = sidecar(path, ".idx");
-    let (mut saved, mut status) = match open_regular(&index_path) {
-        Ok(file) => match serde_json::from_reader::<_, Value>(BufReader::new(file)) {
-            Ok(saved) => (Some(saved), "current"),
-            Err(_) => (None, "invalid"),
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (None, "missing"),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", index_path.display()));
-        }
-    };
+    let (mut saved, mut status) = read_saved_index(&index_path)?;
     let mut hash = saved.is_some().then(Sha256::new);
     let mut matches = true;
     let db = validate_base(
@@ -856,22 +905,16 @@ pub fn check(path: &Path) -> Result<Value> {
     let (snapshot_path, base) = locked_base(path)?;
     let (committed, tail) = journal_lengths(&snapshot_path)?;
     if committed == 0 {
+        let _ = crate::journal_auth::JournalKey::load()?;
         return check_base(&snapshot_path, &base, tail);
     }
-    drop(base);
-    let store = Store::open(path)?;
+    let store = Store::open_locked(snapshot_path, base)?;
     let index = store.index();
     let index_path = sidecar(&store.path, ".idx");
-    let index_status = match open_regular(&index_path) {
-        Ok(file) => match serde_json::from_reader::<_, Value>(BufReader::new(file)) {
-            Ok(saved) if saved == index => "current",
-            Ok(_) => "stale",
-            Err(_) => "invalid",
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", index_path.display()));
-        }
+    let index_status = match read_saved_index(&index_path)? {
+        (Some(saved), _) if saved == index => "current",
+        (Some(_), _) => "stale",
+        (None, status) => status,
     };
     let tables = index["tables"]
         .as_object()
@@ -955,10 +998,10 @@ fn fork_authenticated_log(
 pub fn fork(path: &Path, directory: &Path) -> Result<()> {
     let (snapshot_path, base) = locked_base(path)?;
     let (source_path, mut source, log_end, key) = if has_log(&snapshot_path)? {
-        drop(base);
-        let store = Store::open(path)?;
+        let store = Store::open_locked(snapshot_path, base)?;
         (store.path, store.base, store.log_end, store.key)
     } else {
+        let _ = crate::journal_auth::JournalKey::load()?;
         validate_base(&snapshot_path, &base, |_| {}, |_, _, _| {})?;
         (snapshot_path, base, 0, None)
     };

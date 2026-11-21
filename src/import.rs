@@ -78,18 +78,21 @@ pub fn import(
     let schema = schema.as_ref();
     let input = input.as_ref();
     let output = output.as_ref();
-    let mut sql = String::new();
     let mut schema_file =
         open_regular(schema).with_context(|| format!("opening SQL schema {}", schema.display()))?;
     let schema_before = schema_file.metadata()?;
-    (&mut schema_file)
-        .take(SQL_LIMIT + 1)
-        .read_to_string(&mut sql)?;
+    let sql_bytes = crate::limits::read_bytes(
+        &mut schema_file,
+        SQL_LIMIT,
+        "SQL definition exceeds byte limit",
+    )?;
     unchanged(schema, &schema_file, &schema_before)?;
-    ensure!(
-        sql.len() as u64 <= SQL_LIMIT,
-        "SQL definition exceeds byte limit"
-    );
+    let sql = String::from_utf8(sql_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SQL definition must be UTF-8",
+        )
+    })?;
 
     let mut tables = parse_import_tables(&sql)?;
     let table = match table {

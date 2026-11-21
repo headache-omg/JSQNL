@@ -99,6 +99,7 @@ pub enum Op {
 #[derive(Clone, Debug)]
 pub enum Predicate {
     Compare(String, Op, Value),
+    IsNull(String, bool),
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
 }
@@ -141,17 +142,13 @@ pub(crate) fn validate_version_line(line: &str, first_line: bool) -> Result<()> 
     Ok(())
 }
 
-fn lex(source: &str) -> Result<Vec<Located>> {
-    lex_mode(source, false)
-}
-
-fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
+fn lex_mode(source: &str, ddl: bool, first_line: bool) -> Result<Vec<Located>> {
     let mut result = Vec::new();
     let mut offset = 0;
     while offset < source.len() {
         let rest = &source[offset..];
         let first = rest.chars().next().unwrap();
-        if first.is_whitespace() || (offset == 0 && first == '\u{feff}') {
+        if first.is_whitespace() || (first_line && offset == 0 && first == '\u{feff}') {
             if !ddl && (first == '\n' || offset + first.len_utf8() == source.len()) {
                 let prefix = source[..offset].rsplit('\n').next().unwrap_or_default();
                 if prefix.trim_start_matches('\u{feff}').trim().is_empty() {
@@ -177,7 +174,12 @@ fn lex_mode(source: &str, ddl: bool) -> Result<Vec<Located>> {
                     + line.len()
                     + usize::from(rest.as_bytes().get(line.len()) == Some(&b'\n'));
                 check_record_line(&source[offset - prefix.len()..physical_end])?;
-                validate_version_line(line, !source[..offset].contains('\n'))?;
+            }
+            if !ddl {
+                validate_version_line(
+                    line,
+                    first_line && standalone && !source[..offset].contains('\n'),
+                )?;
             }
             let body = line[2..].trim_start();
             if standalone
@@ -314,8 +316,12 @@ pub(crate) fn check_record_line(line: &str) -> Result<()> {
 }
 
 pub fn parse(source: &str) -> Result<Vec<(u64, Statement)>> {
+    parse_line(source, true)
+}
+
+pub(crate) fn parse_line(source: &str, first_line: bool) -> Result<Vec<(u64, Statement)>> {
     let mut parser = Parser {
-        tokens: lex(source)?,
+        tokens: lex_mode(source, false, first_line)?,
         pos: 0,
     };
     let mut statements = Vec::new();
@@ -402,7 +408,7 @@ fn validate_import_identifier(name: &str) -> Result<()> {
 
 pub(crate) fn parse_import_tables(source: &str) -> Result<Vec<ImportTable>> {
     let mut parser = Parser {
-        tokens: lex_mode(source, true)?,
+        tokens: lex_mode(source, true, true)?,
         pos: 0,
     };
     let mut tables = Vec::new();
@@ -583,11 +589,7 @@ impl Parser {
         if self.word("IS") {
             let negate = self.word("NOT");
             self.expect_word("NULL")?;
-            return Ok(Predicate::Compare(
-                name,
-                if negate { Op::Ne } else { Op::Eq },
-                Value::Null,
-            ));
+            return Ok(Predicate::IsNull(name, !negate));
         }
         if self.word("BETWEEN") {
             let lower = self.value()?;
@@ -600,8 +602,11 @@ impl Parser {
         }
         if self.word("IN") {
             self.expect_symbol("(")?;
-            let values = self.list(Self::value)?;
+            let mut values = self.list(Self::value)?;
             self.expect_symbol(")")?;
+            if values.len() == 1 {
+                return Ok(Predicate::Compare(name, Op::Eq, values.pop().unwrap()));
+            }
             return Ok(Predicate::Or(
                 values
                     .into_iter()
@@ -968,7 +973,7 @@ impl Parser {
             let factor = self
                 .value()?
                 .as_f64()
-                .filter(|factor| (0.0..=1.0).contains(factor))
+                .filter(|factor| (0.0..=1.0).contains(factor) && !factor.is_sign_negative())
                 .ok_or_else(|| anyhow!("DECAY factor must be a number between 0 and 1"))?;
             Ok(Statement::Decay {
                 table,

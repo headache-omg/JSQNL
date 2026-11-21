@@ -95,6 +95,8 @@ pub struct QueryReport {
     pub spill_bytes_written: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oversized_partitions: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl QueryReport {
@@ -162,6 +164,7 @@ impl QueryReport {
             elapsed_ms: 0.0,
             spill_bytes_written: None,
             oversized_partitions: None,
+            warnings: Vec::new(),
         }
     }
 }

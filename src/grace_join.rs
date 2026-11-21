@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -24,6 +24,7 @@ struct Bucket {
 }
 
 impl Bucket {
+    #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
         scratch: &Scratch,
@@ -32,6 +33,7 @@ impl Bucket {
         id: u64,
         row: &Row,
         fields: Option<&BTreeSet<String>>,
+        frame_limit: u64,
     ) -> Result<()> {
         let data = match fields {
             Some(fields) => {
@@ -40,9 +42,17 @@ impl Bucket {
                     .filter(|(name, _)| fields.contains(*name))
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect();
-                serde_json::to_vec(&(id, projected))?
+                crate::limits::encode_with(
+                    &(id, projected),
+                    frame_limit - 1,
+                    "join record exceeds byte limit",
+                )?
             }
-            None => serde_json::to_vec(&(id, row))?,
+            None => crate::limits::encode_with(
+                &(id, row),
+                frame_limit - 1,
+                "join record exceeds byte limit",
+            )?,
         };
         scratch.account(data.len() as u64 + 1)?;
         writers.append(path, &data)?;
@@ -72,10 +82,14 @@ pub(crate) fn hash_key(value: Value) -> Option<String> {
     }
 }
 
-fn records(path: &Path, mut emit: impl FnMut(u64, Row) -> Result<()>) -> Result<()> {
+fn records(
+    path: &Path,
+    frame_limit: u64,
+    mut emit: impl FnMut(u64, Row) -> Result<()>,
+) -> Result<()> {
     let mut input = BufReader::with_capacity(128 * 1024, File::open(path)?);
     let mut line = String::new();
-    while input.read_line(&mut line)? != 0 {
+    while crate::limits::line(&mut input, &mut line, frame_limit)? != 0 {
         let (id, row) = crate::internal_json::decode(line.as_bytes())?;
         emit(id, row)?;
         line.clear();
@@ -89,18 +103,19 @@ struct Partition<'a> {
     left_key: &'a str,
     right_key: &'a str,
     outer: bool,
+    frame_limit: u64,
 }
 
 impl Partition<'_> {
     fn probe_memory(&self, visit: &mut JoinVisitor<'_>) -> Result<()> {
         let mut hash = HashMap::<String, Vec<(u64, Row)>>::new();
-        records(self.right, |id, row| {
+        records(self.right, self.frame_limit, |id, row| {
             if let Some(key) = hash_key(field(id, &row, self.right_key)) {
                 hash.entry(key).or_default().push((id, row));
             }
             Ok(())
         })?;
-        records(self.left, |id, row| {
+        records(self.left, self.frame_limit, |id, row| {
             if let Some(matches) =
                 hash_key(field(id, &row, self.left_key)).and_then(|key| hash.get(&key))
             {
@@ -121,7 +136,7 @@ impl Partition<'_> {
         let tx = db.transaction()?;
         {
             let mut insert = tx.prepare("INSERT INTO rhs VALUES (?, ?, ?)")?;
-            records(self.right, |id, row| {
+            records(self.right, self.frame_limit, |id, row| {
                 if let Some(key) = hash_key(field(id, &row, self.right_key)) {
                     insert.execute(params![key, id, serde_json::to_string(&row)?])?;
                 }
@@ -130,7 +145,7 @@ impl Partition<'_> {
         }
         tx.commit()?;
         let mut select = db.prepare("SELECT id, payload FROM rhs WHERE key = ? ORDER BY id")?;
-        records(self.left, |id, row| {
+        records(self.left, self.frame_limit, |id, row| {
             let mut matched = false;
             if let Some(key) = hash_key(field(id, &row, self.left_key)) {
                 let mut hits = select.query([key])?;
@@ -197,7 +212,11 @@ pub(crate) fn execute(
     let left_fields = fields(options.alias.as_deref().unwrap_or(table), left_key);
     let right_fields = fields(join.alias.as_deref().unwrap_or(&join.table), right_key);
     let mut validation = KeyValidation::new(ScratchSlot::new(Some(scratch.clone())));
-    let mut writers = PartitionWriters::default();
+    let buffer_size = usize::try_from(budget / (PARTITIONS as u64 * 4))
+        .unwrap_or(32 * 1024)
+        .clamp(512, 32 * 1024);
+    let mut writers = PartitionWriters::with_buffer(buffer_size);
+    let frame_limit = crate::limits::frame()?;
     let (db, rows, bytes) = walk_base(
         path,
         base,
@@ -225,6 +244,7 @@ pub(crate) fn execute(
                         id,
                         row,
                         left_fields.as_ref(),
+                        frame_limit,
                     )?;
                 }
             }
@@ -239,6 +259,7 @@ pub(crate) fn execute(
                     id,
                     row,
                     right_fields.as_ref(),
+                    frame_limit,
                 )?;
             }
             Ok(())
@@ -266,7 +287,7 @@ pub(crate) fn execute(
                 if left.rows != 0 {
                     if right.rows == 0 {
                         if join.left {
-                            records(&left_path, |id, row| visit(id, &row, None))?;
+                            records(&left_path, frame_limit, |id, row| visit(id, &row, None))?;
                         }
                     } else {
                         let partition = Partition {
@@ -275,6 +296,7 @@ pub(crate) fn execute(
                             left_key,
                             right_key,
                             outer: join.left,
+                            frame_limit,
                         };
                         if right.bytes > budget || right.rows > budget / 128 {
                             skew_partitions += 1;
@@ -304,7 +326,7 @@ pub(crate) fn execute(
         rows,
         bytes,
         spill_bytes,
-        result_spill: aggregate_spill,
         skew_partitions,
+        result_spill: aggregate_spill,
     })
 }

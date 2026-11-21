@@ -112,13 +112,12 @@ impl<'a> Sorter<'a> {
     }
 
     fn write(&self, writer: &mut BufWriter<File>, bytes: &mut u64, row: OrderedRow) -> Result<()> {
-        let data = serde_json::to_vec(&row)?;
+        let data = crate::limits::encode_with(
+            &row,
+            self.frame_limit - 1,
+            "sort record exceeds byte limit",
+        )?;
         let size = data.len() as u64 + 1;
-        anyhow::ensure!(
-            size <= self.frame_limit,
-            "sort record exceeds byte limit ({})",
-            self.frame_limit
-        );
         self.scratch.get()?.account(size)?;
         writer.write_all(&data)?;
         writer.write_all(b"\n")?;

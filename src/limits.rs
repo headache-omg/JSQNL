@@ -20,9 +20,76 @@ pub(crate) fn valid_line_ending(line: &str) -> bool {
     !body.strip_suffix('\r').unwrap_or(body).contains('\r')
 }
 
+fn read_limited_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    limit: u64,
+    message: &str,
+) -> Result<usize> {
+    let mut read = 0usize;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if available.is_empty() {
+            return Ok(read);
+        }
+        let (chunk, done) = match available.iter().position(|&byte| byte == b'\n') {
+            Some(pos) => (&available[..=pos], true),
+            None => (available, false),
+        };
+        ensure!(
+            (read as u64).saturating_add(chunk.len() as u64) <= limit,
+            "{message} ({limit})"
+        );
+        output
+            .try_reserve(chunk.len())
+            .map_err(std::io::Error::other)?;
+        output.extend_from_slice(chunk);
+        let consumed = chunk.len();
+        reader.consume(consumed);
+        read += consumed;
+        if done {
+            return Ok(read);
+        }
+    }
+}
+
+pub(crate) fn read_bytes(mut reader: impl Read, limit: u64, message: &str) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(output),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            (output.len() as u64).saturating_add(count as u64) <= limit,
+            "{message} ({limit})"
+        );
+        output.try_reserve(count).map_err(std::io::Error::other)?;
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
 pub(crate) fn line(reader: &mut impl BufRead, output: &mut String, limit: u64) -> Result<usize> {
-    let count = reader.take(limit.saturating_add(1)).read_line(output)?;
-    ensure!(count as u64 <= limit, "record exceeds byte limit ({limit})");
+    let mut bytes = Vec::new();
+    let count = read_limited_line(reader, &mut bytes, limit, "record exceeds byte limit")?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })?;
+    if output.is_empty() {
+        *output = text;
+    } else {
+        output.push_str(&text);
+    }
     Ok(count)
 }
 
@@ -31,25 +98,27 @@ pub(crate) fn frame_line(
     output: &mut Vec<u8>,
     limit: u64,
 ) -> Result<usize> {
-    let count = reader
-        .take(limit.saturating_add(1))
-        .read_until(b'\n', output)?;
-    ensure!(
-        count as u64 <= limit,
-        "journal frame exceeds byte limit ({limit})"
-    );
-    Ok(count)
+    read_limited_line(reader, output, limit, "journal frame exceeds byte limit")
 }
 
 pub(crate) fn encode(value: &impl serde::Serialize, limit: u64) -> Result<Vec<u8>> {
+    encode_with(value, limit, "journal frame exceeds byte limit")
+}
+
+pub(crate) fn encode_with(
+    value: &impl serde::Serialize,
+    limit: u64,
+    message: &'static str,
+) -> Result<Vec<u8>> {
     struct Limited {
         data: Vec<u8>,
         limit: u64,
+        message: &'static str,
     }
     impl std::io::Write for Limited {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if (self.data.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
-                return Err(std::io::Error::other("journal frame exceeds byte limit"));
+                return Err(std::io::Error::other(self.message));
             }
             self.data
                 .try_reserve(bytes.len())
@@ -64,6 +133,7 @@ pub(crate) fn encode(value: &impl serde::Serialize, limit: u64) -> Result<Vec<u8
     let mut output = Limited {
         data: Vec::new(),
         limit,
+        message,
     };
     serde_json::to_writer(&mut output, value)?;
     Ok(output.data)

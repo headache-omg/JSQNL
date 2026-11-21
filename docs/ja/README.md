@@ -101,7 +101,7 @@ INJECT age FROM users THE 1 WHO + 2;
 - 型は `INT`（符号付き64ビット整数）、`FLOAT`（JSON数値）、`TEXT`、`BOOL`、`JSON`、`VECTOR(n)` です。未宣言の列、重複する列宣言、空のスキーマを拒否します。各テーブルに `INT` または `TEXT` の `PRIMARY KEY` を1列まで指定できます。`NOT NULL` と主キーの省略・nullはエラーです。その他の列の省略はWHEREと明示的な列選択でnullとして評価されます。`SELECT *` は保存済みのフィールドを返します。
 - SQL文はセミコロンで終了します。キーワードと型名の大文字・小文字は区別しません。識別子はASCIIの英字またはアンダースコアから始まり、英数字とアンダースコアを使用できます。識別子の大文字・小文字は区別します。文字列にはJSONの二重引用符、またはSQL式の単一引用符と `''` エスケープを使えます。
 - INSERTは `VALUES (値, ...)` または列リストを省略した `VALUES {JSONオブジェクト}` を受け付けます。位置指定で列リストを省略するとスキーマの宣言順を使います。UPDATEの代入値とWHEREの比較右辺はリテラルです。
-- WHEREは `=`、`!=`、`<>`、`<`、`<=`、`>`、`>=`、`AND`、`OR`、括弧に対応します。数値同士、文字列同士を大小比較できます。等値比較はJSON値に対して行い、`col = NULL` で欠損またはnullを検索できます。ANDがORより先に評価されます。WHEREを省略したUPDATE・DELETEは全件に作用します。SELECT結果は論理IDの昇順です。
+- WHEREは `=`、`!=`、`<>`、`<`、`<=`、`>`、`>=`、`AND`、`OR`、括弧に対応します。数値同士、文字列同士を大小比較できます。欠損またはnullを検索するには `col IS NULL` を使います。通常の比較演算子で欠損やnullを比較した行はWHEREに一致しません。ANDがORより先に評価されます。WHEREを省略したUPDATE・DELETEは全件に作用します。SELECT結果は論理IDの昇順です。
 
 ### 検索件数と並べ替え
 
@@ -110,7 +110,7 @@ SELECT name FROM users WHERE age BETWEEN 18 AND 25 ORDER BY age DESC, name ASC L
 SELECT COUNT(*) AS total FROM users WHERE age IS NOT NULL;
 ```
 
-`SELECT` は複数列の `ORDER BY`、`ASC` / `DESC`、`LIMIT`、`OFFSET` と `COUNT(*) [AS 名前]` に対応します。並べ替えの同点は論理ID順です。昇順ではnullが先で、降順では後です。WHEREには `IS NULL`、`IS NOT NULL`、`BETWEEN`、`IN` も書けます。nullの等値比較は従来のJSQNLに従います。同じ構文をParquetの `scan` にも使えます。並べ替えに `LIMIT` を付けると候補の保持数は `OFFSET + LIMIT` の約2倍までに抑えられます。並べ替えがメモリ予算を超えると、ソート済みの小さな一時ファイルに分け、最大8本ずつマージします。
+`SELECT` は複数列の `ORDER BY`、`ASC` / `DESC`、`LIMIT`、`OFFSET` と `COUNT(*) [AS 名前]` に対応します。並べ替えの同点は論理ID順です。昇順ではnullが先で、降順では後です。WHEREには `IS NULL`、`IS NOT NULL`、`BETWEEN`、`IN` も書けます。同じ構文をParquetの `scan` にも使えます。並べ替えに `LIMIT` を付けると候補の保持数は `OFFSET + LIMIT` の約2倍までに抑えられます。並べ替えがメモリ予算を超えると、ソート済みの小さな一時ファイルに分け、最大8本ずつマージします。
 
 ### 結合とグループ集計
 

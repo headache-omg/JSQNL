@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn fingerprint(file: &File) -> Result<String> {
@@ -148,13 +149,18 @@ pub fn build(path: &Path) -> Result<()> {
         !has_log(&path)?,
         "disk-index requires a base file without an update log"
     );
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let signature = fingerprint(&base)?;
     let index = sidecar(&path, ".seek.sqlite");
     if let Some(auxiliary) = unexpected_sidecar(&index)? {
         anyhow::bail!("unexpected disk index sidecar: {}", auxiliary.display());
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let stage = sidecar(&index, &format!(".{nonce}.tmp"));
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stage = sidecar(
+        &index,
+        &format!(".{}.{nonce}.{sequence}.tmp", std::process::id()),
+    );
     let seal_stage = sidecar(&stage, ".seal");
     private_options().create_new(true).open(&stage)?;
     let result = (|| -> Result<()> {
@@ -252,7 +258,8 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
         return Ok(None);
     }
     let file = open_regular(&index)?;
-    if seal.base != fingerprint(base)? || seal.index != fingerprint(&file)? {
+    let index_before = fingerprint(&file)?;
+    if seal.base != fingerprint(base)? || seal.index != index_before {
         return Ok(None);
     }
     let sqlite = Connection::open_with_flags(
@@ -260,6 +267,12 @@ fn open_current(path: &Path, base: &File) -> Result<Option<Connection>> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .with_context(|| format!("opening disk index {}", index.display()))?;
+    let after = open_regular(&index)?;
+    if fingerprint(&after)? != index_before {
+        return Ok(None);
+    }
+    drop(file);
+    drop(after);
     sqlite.pragma_update(None, "trusted_schema", false)?;
     let saved: String = sqlite.query_row("SELECT fingerprint FROM meta", [], |row| row.get(0))?;
     Ok((saved == fingerprint(base)?).then_some(sqlite))

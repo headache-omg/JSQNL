@@ -131,9 +131,14 @@ def open_shard(path):
     return open(path, "rb", opener=opener)
 
 
+def shard_identity(source):
+    info = os.fstat(source.fileno())
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def read_schema(path):
     with open_shard(path) as source:
-        return pq.read_schema(source)
+        return pq.read_schema(source), shard_identity(source)
 
 
 def scan(directory, required, projection):
@@ -141,7 +146,8 @@ def scan(directory, required, projection):
     if not paths:
         raise ValueError(f"No Parquet files in {directory}")
 
-    schema = read_schema(paths[0])
+    identities = {}
+    schema, identities[paths[0]] = read_schema(paths[0])
     if len(set(schema.names)) != len(schema.names) or "_line" in schema.names:
         raise ValueError("Parquet column names must be unique and cannot include _line")
     for column in required:
@@ -150,30 +156,36 @@ def scan(directory, required, projection):
 
     # Validate all shard schemas before emitting query results.
     for path in paths[1:]:
-        if not read_schema(path).equals(schema):
+        other_schema, identities[path] = read_schema(path)
+        if not other_schema.equals(schema):
             raise ValueError(f"Parquet schema mismatch: {path}")
 
     for path in paths:
-        with open_shard(path) as source, pq.ParquetFile(source) as parquet:
-            if projection == []:
-                for _ in range(parquet.metadata.num_rows):
-                    sys.stdout.buffer.write(b"{}\n")
-                continue
-            for batch in parquet.iter_batches(batch_size=256, columns=projection):
-                if projection is not None:
-                    # Arrow's Parquet projection treats dotted names as paths.
-                    # Drop any incidental parent columns before converting values.
-                    batch = batch.select(projection)
-                for row in json_rows(batch):
-                    line = json.dumps(row, default=json_default, ensure_ascii=False,
-                                      allow_nan=False, separators=(",", ":"))
-                    sys.stdout.buffer.write(line.encode("utf-8") + b"\n")
+        with open_shard(path) as source:
+            if shard_identity(source) != identities[path]:
+                raise ValueError(f"Parquet shard changed during scan: {path}")
+            with pq.ParquetFile(source) as parquet:
+                if projection == []:
+                    for _ in range(parquet.metadata.num_rows):
+                        sys.stdout.buffer.write(b"{}\n")
+                    continue
+                for batch in parquet.iter_batches(batch_size=256, columns=projection):
+                    if projection is not None:
+                        # Arrow's Parquet projection treats dotted names as paths.
+                        # Drop any incidental parent columns before converting values.
+                        batch = batch.select(projection)
+                    for row in json_rows(batch):
+                        line = json.dumps(row, default=json_default, ensure_ascii=False,
+                                          allow_nan=False, separators=(",", ":"))
+                        sys.stdout.buffer.write(line.encode("utf-8") + b"\n")
 
 
 if __name__ == "__main__":
     try:
         required, projection = json.load(sys.stdin.buffer)
         scan(sys.argv[1], required, projection)
-    except (OSError, TypeError, ValueError) as error:
+    except BrokenPipeError:
+        os._exit(0)
+    except (OSError, TypeError, ValueError, pa.ArrowException) as error:
         sys.exit(f"Parquet: {error}")
 

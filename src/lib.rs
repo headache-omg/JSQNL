@@ -54,8 +54,11 @@ pub fn execute(
     let started = Instant::now();
     check_query_length(sql)?;
     let statements = parse(sql)?;
-    if let [(_, Statement::ExplainAnalyze(statement))] = statements.as_slice() {
-        let mut report = execute_parsed(path.as_ref(), vec![(0, *statement.clone())], |_| Ok(()))?;
+    if let [(offset, Statement::ExplainAnalyze(statement))] = statements.as_slice() {
+        let mut report =
+            execute_parsed(path.as_ref(), vec![(*offset, *statement.clone())], |_| {
+                Ok(())
+            })?;
         report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         emit(serde_json::to_value(&report)?)?;
         return Ok(report);

@@ -151,6 +151,7 @@ fn rust_and_reference_reader_reject_incompatible_files() {
         "-- SCHEMA: t (n INT NOT NULL)\n{\"n\":null}\n",
         "-- SCHEMA: t (n INT PRIMARY KEY)\n{\"n\":1}\n{\"n\":1}\n",
         "-- SCHEMA: t (n JSON)\n{\"n\": 1e400}\n",
+        "-- SCHEMA: t (n INT)\n{\"n\":1}\r \n",
     ] {
         fs::write(&path, source).unwrap();
         assert!(
@@ -239,7 +240,7 @@ fn reference_reader_matches_schema_tokens_and_validates_overwritten_values() {
         ("SCHEMA t (n VECTOR(2)NOT NULL)\n{\"n\":[1,2]}", true),
         ("SCHEMA t (n JSON)\n{\"n\":[\"\\ud800\"],\"n\":1}", false),
         ("SCHEMA t (n INT)\n{\"n\":\r1}", false),
-        ("SCHEMA t (n TEXT) -- JSQNL: 9\n{\"n\":\"雪\"}", true),
+        ("SCHEMA t (n TEXT) -- ordinary note\n{\"n\":\"雪\"}", true),
     ] {
         fs::write(&path, body).unwrap();
         assert_eq!(
@@ -260,4 +261,18 @@ fn reference_reader_matches_schema_tokens_and_validates_overwritten_values() {
             assert!(serde_json::from_slice::<Vec<Value>>(&read.stdout).is_ok());
         }
     }
+}
+
+#[test]
+fn parquet_scan_propagates_reader_stderr_in_error() {
+    let dir = Temp::new();
+    let table_dir = dir.0.join("items");
+    fs::create_dir(&table_dir).unwrap();
+    let error = jsqnl::scan_parquet(&table_dir, "SELECT * FROM items;", |_| Ok(()))
+        .expect_err("empty parquet directory or missing pyarrow must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("Parquet:"),
+        "expected reader stderr details in error, got: {message}"
+    );
 }
