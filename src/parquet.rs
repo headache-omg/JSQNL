@@ -80,7 +80,8 @@ pub fn scan(
         Ok(!results.is_saturated())
     })
     .context("Parquet: reading shards")?;
-    results.finish_with(&mut emit)
+    results.finish_with(&mut emit)?;
+    Ok(())
 }
 
 fn open_shard(path: &Path) -> Result<std::fs::File> {
