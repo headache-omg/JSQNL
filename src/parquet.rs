@@ -130,8 +130,7 @@ fn identity(file: &std::fs::File) -> Result<ShardIdentity> {
 }
 
 fn same_fields(left: &arrow::datatypes::Fields, right: &arrow::datatypes::Fields) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(a, b)| same_field(a, b))
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| same_field(a, b))
 }
 
 fn same_field(left: &arrow::datatypes::Field, right: &arrow::datatypes::Field) -> bool {
@@ -344,7 +343,10 @@ fn value(array: &dyn arrow::array::Array, index: usize, depth: usize) -> Result<
                     !row.contains_key(field.name()),
                     "Parquet struct field names must be unique"
                 );
-                row.insert(field.name().clone(), value(column.as_ref(), index, depth + 1)?);
+                row.insert(
+                    field.name().clone(),
+                    value(column.as_ref(), index, depth + 1)?,
+                );
             }
             Value::Object(row)
         }
