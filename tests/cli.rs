@@ -530,8 +530,8 @@ fn write_parquet(path: &Path, columns: Vec<(&str, arrow::array::ArrayRef)>) {
     use parquet::arrow::ArrowWriter;
 
     let batch = RecordBatch::try_from_iter(columns).unwrap();
-    let mut writer = ArrowWriter::try_new(fs::File::create(path).unwrap(), batch.schema(), None)
-        .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(path).unwrap(), batch.schema(), None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
@@ -2074,7 +2074,10 @@ fn parquet_projection_preserves_dotted_names_timestamps_and_utf8() {
     let db = Fixture::new(None);
     let path = db.file("my-data");
     fs::create_dir(&path).unwrap();
-    use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, TimestampNanosecondArray};
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, Int64Array, StringArray, StructArray,
+        TimestampNanosecondArray,
+    };
     use arrow::datatypes::Field;
     use std::sync::Arc;
 
@@ -2083,12 +2086,18 @@ fn parquet_projection_preserves_dotted_names_timestamps_and_utf8() {
         Arc::new(StructArray::from(vec![(field, values)]))
     }
 
-    let stamp = Arc::new(TimestampNanosecondArray::from(vec![1700000000123456789])
-        .with_timezone("UTC"));
+    let stamp =
+        Arc::new(TimestampNanosecondArray::from(vec![1700000000123456789]).with_timezone("UTC"));
     write_parquet(
         &path.join("one.parquet"),
         vec![
-            ("a", structure("b", Arc::new(BinaryArray::from_vec(vec![b"bytes".as_slice()])))),
+            (
+                "a",
+                structure(
+                    "b",
+                    Arc::new(BinaryArray::from_vec(vec![b"bytes".as_slice()])),
+                ),
+            ),
             ("a.b", Arc::new(Int64Array::from(vec![42]))),
             ("ts", stamp.clone()),
             ("nested", structure("ts", stamp)),
@@ -2168,7 +2177,7 @@ fn unfinished_log_suffix_is_ignored_until_the_next_commit() {
 #[test]
 fn replay_budget_counts_live_rows_across_transactions() {
     let fields: Vec<_> = (0..12).map(|i| format!("a{i} INT")).collect();
-    let db = Fixture::new(Some(&format!("SCHEMA t ({})\n", columns.join(","))));
+    let db = Fixture::new(Some(&format!("SCHEMA t ({})\n", fields.join(","))));
     db.exec(&format!("INSERT INTO t VALUES ({});", ["0"; 12].join(",")));
     for i in 1..=14 {
         db.exec(&format!("UPDATE t SET a0={i};"));
@@ -2278,18 +2287,38 @@ fn parquet_preserves_temporal_values_and_handles_wide_projection() {
     let db = Fixture::new(None);
     let path = db.file("archive");
     fs::create_dir(&path).unwrap();
-    use arrow::array::{ArrayRef, Date32Array, Int64Array, Time64NanosecondArray, TimestampNanosecondArray};
+    use arrow::array::{
+        ArrayRef, Date32Array, Int64Array, Time64NanosecondArray, TimestampNanosecondArray,
+    };
     use std::sync::Arc;
 
     let columns: Vec<_> = (0..15000).map(|i| format!("f{i:05}")).collect();
-    let mut arrays: Vec<(&str, ArrayRef)> = columns.iter().enumerate().map(|(i, name)| {
-        (name.as_str(), Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef)
-    }).collect();
+    let mut arrays: Vec<(&str, ArrayRef)> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                name.as_str(),
+                Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef,
+            )
+        })
+        .collect();
     arrays.extend([
-        ("パリ", Arc::new(TimestampNanosecondArray::from(vec![-2208988800000000000])
-            .with_timezone("Europe/Paris")) as ArrayRef),
-        ("future", Arc::new(Date32Array::from(vec![2932897])) as ArrayRef),
-        ("clock", Arc::new(Time64NanosecondArray::from(vec![123456789])) as ArrayRef),
+        (
+            "パリ",
+            Arc::new(
+                TimestampNanosecondArray::from(vec![-2208988800000000000])
+                    .with_timezone("Europe/Paris"),
+            ) as ArrayRef,
+        ),
+        (
+            "future",
+            Arc::new(Date32Array::from(vec![2932897])) as ArrayRef,
+        ),
+        (
+            "clock",
+            Arc::new(Time64NanosecondArray::from(vec![123456789])) as ArrayRef,
+        ),
     ]);
     write_parquet(&path.join("test.parquet"), arrays);
     let result = rows(

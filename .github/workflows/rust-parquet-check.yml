@@ -13,6 +13,4 @@ jobs:
       - run: |
           rustfmt +1.89.0 --edition 2024 src/parquet.rs tests/api.rs tests/cli.rs
           git diff
-      - run: cargo +1.89.0 test
-      - if: always()
-        run: cat Cargo.lock
+      - run: cargo +1.89.0 test --locked

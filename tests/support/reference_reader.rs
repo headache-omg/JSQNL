@@ -46,9 +46,9 @@ impl Column {
             Kind::Text => value.is_string(),
             Kind::Bool => value.is_boolean(),
             Kind::Json => true,
-            Kind::Vector(size) => value.as_array().is_some_and(|values| {
-                values.len() == size && values.iter().all(Value::is_number)
-            }),
+            Kind::Vector(size) => value
+                .as_array()
+                .is_some_and(|values| values.len() == size && values.iter().all(Value::is_number)),
         }
     }
 }
@@ -69,9 +69,15 @@ impl Table {
         for raw in table[2].split(',') {
             let column = COLUMN.captures(raw.trim()).context("invalid column")?;
             let name = &column[1];
-            ensure!(name != "_line" && !columns.contains_key(name), "reserved or duplicate column");
+            ensure!(
+                name != "_line" && !columns.contains_key(name),
+                "reserved or duplicate column"
+            );
             let kind = if let Some(dimension) = column.get(3) {
-                ensure!(!dimension.as_str().starts_with('0'), "invalid VECTOR dimension");
+                ensure!(
+                    !dimension.as_str().starts_with('0'),
+                    "invalid VECTOR dimension"
+                );
                 Kind::Vector(dimension.as_str().parse()?)
             } else {
                 match column[2].to_ascii_uppercase().as_str() {
@@ -85,7 +91,9 @@ impl Table {
             };
             let constraints = &column[4];
             ensure!(
-                constraints.is_empty() || constraints.starts_with(' ') || matches!(kind, Kind::Vector(_)),
+                constraints.is_empty()
+                    || constraints.starts_with(' ')
+                    || matches!(kind, Kind::Vector(_)),
                 "expected a separator before constraints"
             );
             let constraints = constraints.to_ascii_uppercase();
@@ -100,12 +108,29 @@ impl Table {
                 }
             }
             if primary_key {
-                ensure!(primary.is_none() && matches!(kind, Kind::Int | Kind::Text), "invalid primary key");
+                ensure!(
+                    primary.is_none() && matches!(kind, Kind::Int | Kind::Text),
+                    "invalid primary key"
+                );
                 primary = Some(name.to_owned());
             }
-            columns.insert(name.to_owned(), Column { kind, required: not_null || primary_key });
+            columns.insert(
+                name.to_owned(),
+                Column {
+                    kind,
+                    required: not_null || primary_key,
+                },
+            );
         }
-        Ok((table[1].to_owned(), Self { columns, primary, keys: HashSet::new(), rows: Vec::new() }))
+        Ok((
+            table[1].to_owned(),
+            Self {
+                columns,
+                primary,
+                keys: HashSet::new(),
+                rows: Vec::new(),
+            },
+        ))
     }
 
     fn push(&mut self, text: &str) -> Result<()> {
@@ -113,11 +138,17 @@ impl Table {
         let object = row.as_object().context("expected a JSON object")?;
         ensure!(
             object.keys().all(|key| self.columns.contains_key(key))
-                && self.columns.iter().all(|(name, column)| column.accepts(&row[name])),
+                && self
+                    .columns
+                    .iter()
+                    .all(|(name, column)| column.accepts(&row[name])),
             "row violates SCHEMA"
         );
         if let Some(primary) = &self.primary {
-            ensure!(self.keys.insert(row[primary].to_string()), "duplicate primary key");
+            ensure!(
+                self.keys.insert(row[primary].to_string()),
+                "duplicate primary key"
+            );
         }
         self.rows.push(row);
         Ok(())
@@ -138,18 +169,33 @@ pub fn read(path: &Path, table: &str) -> Result<Vec<Value>> {
         let text = line.trim();
         if text.starts_with('{') {
             let name = current.as_ref().context("JSONL row before SCHEMA")?;
-            tables.get_mut(name).context("missing current table")?.push(text)?;
+            tables
+                .get_mut(name)
+                .context("missing current table")?
+                .push(text)?;
             continue;
         }
-        let directive: String = text.chars().map(|ch| if ch.is_whitespace() { ' ' } else { ch }).collect();
+        let directive: String = text
+            .chars()
+            .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+            .collect();
         if let Some(header) = HEADER.captures(&directive) {
-            ensure!(index == 0 && &header[1] == "1", "unsupported version or position");
+            ensure!(
+                index == 0 && &header[1] == "1",
+                "unsupported version or position"
+            );
         } else if let Some(schema) = SCHEMA.captures(&directive) {
             let (name, table) = Table::parse(&schema[1])?;
-            ensure!(tables.insert(name.clone(), table).is_none(), "duplicate table");
+            ensure!(
+                tables.insert(name.clone(), table).is_none(),
+                "duplicate table"
+            );
             current = Some(name);
         } else {
-            ensure!(text.is_empty() || text.starts_with("--"), "expected a JSON object");
+            ensure!(
+                text.is_empty() || text.starts_with("--"),
+                "expected a JSON object"
+            );
         }
     }
     Ok(tables.remove(table).context("unknown table")?.rows)
