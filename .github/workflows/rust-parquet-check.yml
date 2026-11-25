@@ -1,0 +1,14 @@
+name: Verify the Rust Parquet port
+on:
+  push:
+    branches: [rust-parquet-port]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt
+      - run: cargo +1.89.0 generate-lockfile && cat Cargo.lock
+      - run: cargo +1.89.0 test --locked

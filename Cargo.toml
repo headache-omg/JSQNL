@@ -9,12 +9,18 @@ description = "A local SQL and JSON Lines database"
 
 [dependencies]
 anyhow = "1"
+arrow = { version = "56", default-features = false, features = ["chrono-tz"] }
+chrono = { version = "0.4", default-features = false }
+parquet = "56"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth"] }
 sha2 = "0.10"
 subtle = "2.6"
 zeroize = "1.9"
 rusqlite = "0.34"
+
+[dev-dependencies]
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

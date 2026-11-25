@@ -1,8 +1,7 @@
 use jsqnl::{AccessPath, build_disk_index, execute, explain_analyze, init};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Temp(PathBuf);
@@ -97,15 +96,10 @@ fn streaming_join_plan_reads_left_range_and_uses_only_needed_right_fields() {
     assert!(stats.base_bytes_read > fs::metadata(path).unwrap().len());
 }
 
-fn reference(path: &Path, table: &str) -> std::process::Output {
-    let python = std::env::var_os("JSQNL_COMPAT_PYTHON").unwrap_or_else(|| "python3".into());
-    Command::new(python)
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference_reader.py"))
-        .arg(path)
-        .arg(table)
-        .output()
-        .expect("compatibility tests require an independent Python 3 interpreter")
-}
+#[path = "support/reference_reader.rs"]
+mod reference_reader;
+
+use reference_reader::read as reference;
 
 #[test]
 fn rust_and_reference_reader_agree_on_versioned_and_legacy_files() {
@@ -115,13 +109,7 @@ fn rust_and_reference_reader_agree_on_versioned_and_legacy_files() {
         ("examples/users.jsqnl", "users"),
     ] {
         let path = root.join(file);
-        let output = reference(&path, table);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let expected: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        let expected = reference(&path, table).unwrap();
         let mut actual = Vec::new();
         execute(&path, &format!("SELECT * FROM {table};"), |row| {
             actual.push(row);
@@ -158,7 +146,7 @@ fn rust_and_reference_reader_reject_incompatible_files() {
             execute(&path, "SELECT * FROM t;", |_| Ok(())).is_err(),
             "{source}"
         );
-        assert!(!reference(&path, "t").status.success(), "{source}");
+        assert!(reference(&path, "t").is_err(), "{source}");
     }
 }
 
@@ -216,14 +204,11 @@ fn format_readers_agree_on_schema_comments_line_endings_and_finite_numbers() {
             rows.push(row);
             Ok(())
         });
-        let python = reference(&path, "t");
+        let independent = reference(&path, "t");
         assert_eq!(rust.is_ok(), valid, "{rust:?}");
-        assert_eq!(python.status.success(), valid, "{python:?}");
+        assert_eq!(independent.is_ok(), valid, "{independent:?}");
         if valid {
-            assert_eq!(
-                serde_json::from_slice::<Vec<Value>>(&python.stdout).unwrap(),
-                rows
-            );
+            assert_eq!(independent.unwrap(), rows);
         }
     }
 }
@@ -248,31 +233,21 @@ fn reference_reader_matches_schema_tokens_and_validates_overwritten_values() {
             valid,
             "{body}"
         );
-        let python = std::env::var_os("JSQNL_COMPAT_PYTHON").unwrap_or_else(|| "python3".into());
-        let read = Command::new(python)
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference_reader.py"))
-            .arg(&path)
-            .arg("t")
-            .env("PYTHONIOENCODING", "ascii")
-            .output()
-            .unwrap();
-        assert_eq!(read.status.success(), valid, "{body}: {read:?}");
-        if valid {
-            assert!(serde_json::from_slice::<Vec<Value>>(&read.stdout).is_ok());
-        }
+        let read = reference(&path, "t");
+        assert_eq!(read.is_ok(), valid, "{body}: {read:?}");
     }
 }
 
 #[test]
-fn parquet_scan_propagates_reader_stderr_in_error() {
+fn parquet_scan_reports_empty_directory() {
     let dir = Temp::new();
     let table_dir = dir.0.join("items");
     fs::create_dir(&table_dir).unwrap();
     let error = jsqnl::scan_parquet(&table_dir, "SELECT * FROM items;", |_| Ok(()))
-        .expect_err("empty parquet directory or missing pyarrow must fail");
+        .expect_err("empty Parquet directory must fail");
     let message = format!("{error:#}");
     assert!(
-        message.contains("Parquet:"),
-        "expected reader stderr details in error, got: {message}"
+        message.contains("No Parquet files"),
+        "expected an empty-directory error, got: {message}"
     );
 }

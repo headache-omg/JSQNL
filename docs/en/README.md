@@ -68,7 +68,7 @@ IN2JSQNL combines one supported SQL `CREATE TABLE` definition with a JSON object
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-`scan` queries Parquet shards with identical schemas in filename order. It requires an existing PyArrow installation. Set `JSQNL_PYTHON` to that Python interpreter if necessary. The table name comes from the directory name, or the parent's name when the directory is named `data`. Use one read-only `SELECT` per scan.
+`scan` queries Parquet shards with identical schemas in filename order. The table name comes from the directory name, or the parent's name when the directory is named `data`. Use one read-only `SELECT` per scan.
 
 ```sh
 ./target/release/jsqnl scan /path/to/enwiki/data 'SELECT identifier FROM enwiki LIMIT 5;'
