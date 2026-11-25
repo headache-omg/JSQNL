@@ -68,7 +68,7 @@ IN2JSQNL 結合一個受支援的 SQL `CREATE TABLE` 定義和 JSON 物件、JSO
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-`scan` 依檔名順序讀取結構一致的 Parquet 分檔。請先安裝 PyArrow，必要時以 `JSQNL_PYTHON` 指定對應的 Python。資料表名稱取自目錄名稱。若目錄名為 `data`，則採用上層目錄名稱。每次掃描可執行一個唯讀 `SELECT`。
+`scan` 依檔名順序讀取結構一致的 Parquet 分檔。資料表名稱取自目錄名稱。若目錄名為 `data`，則採用上層目錄名稱。每次掃描可執行一個唯讀 `SELECT`。
 
 ```sh
 ./target/release/jsqnl scan /path/to/enwiki/data 'SELECT identifier FROM enwiki LIMIT 5;'

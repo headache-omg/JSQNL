@@ -45,7 +45,7 @@ Rustからは `jsqnl::import` を呼び出せます。
 
 ## ファイル仕様とRust API
 
-[FORMAT.md](../../FORMAT.md) は、`.jsqnl` の形式バージョン1、型、NULL、バージョンヘッダー、エスケープを定義します。ヘッダーのない既存ファイルもバージョン1として開けます。互換性テストはRust実装と独立したPython 3の読み取り実装で同じファイルを比較します。
+[FORMAT.md](../../FORMAT.md) は、`.jsqnl` の形式バージョン1、型、NULL、バージョンヘッダー、エスケープを定義します。ヘッダーのない既存ファイルもバージョン1として開けます。互換性テストはRust実装と独立したRustの読み取り実装で同じファイルを比較します。
 
 Rustアプリからは `jsqnl::execute` にファイル、SQL、結果行を受け取るコールバックを渡せます。CLIも同じAPIを使用します。結果コールバックから同じDBを照会・更新できます。読み取り中に書き込んだ変更は、進行中のSELECTの結果には反映されません。
 
@@ -73,7 +73,6 @@ jsqnl exec users.jsqnl 'EXPLAIN ANALYZE SELECT name FROM users WHERE id = 2;'
 
 ディレクトリ名や列名にハイフン・空白・日本語がある場合は、`SELECT "年度" FROM "my-data"` のように二重引用符で囲みます。
 
-Parquetの読み取りにはPyArrowが必要です。既定の `python3` で利用できるようにするか、`JSQNL_PYTHON` にインストール済みのPythonを指定してください。
 
 ```sh
 jsqnl scan /path/to/archive/enwiki/data 'SELECT _line, identifier, name FROM enwiki WHERE identifier = 123;'
@@ -81,7 +80,7 @@ jsqnl scan /path/to/archive/enwiki/data 'SELECT _line, identifier, name FROM enw
 
 `_line` はディレクトリ全体の1始まりの行番号です。ファイルの追加・改名・並べ替えで変わり得ます。日付・日時はISO形式の文字列になります。Parquet側は読み取り専用です。スキャン中の読み出しエラーは非ゼロの終了コードで報告され、先に出力した行が残ることがあります。
 
-PyArrow付きの環境では `cargo test --locked scan_queries_all_parquet_shards_in_filename_order -- --ignored` でParquet結合テストを実行できます。
+`cargo test --locked scan_queries_all_parquet_shards_in_filename_order` でParquet結合テストを実行できます。
 
 ## 言語仕様
 

@@ -525,29 +525,34 @@ fn indexed_equalities_preserve_predicate_and_mutation_semantics() {
     );
 }
 
+fn write_parquet(path: &Path, columns: Vec<(&str, arrow::array::ArrayRef)>) {
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let batch = RecordBatch::try_from_iter(columns).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(path).unwrap(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
 #[test]
-#[ignore = "requires a Python with PyArrow; set JSQNL_PYTHON"]
 fn scan_queries_all_parquet_shards_in_filename_order() {
     let fixture = Fixture::new(None);
     let directory = fixture.file("articles");
     fs::create_dir(&directory).unwrap();
-    let python = std::env::var_os("JSQNL_PYTHON").unwrap_or_else(|| "python3".into());
-    let setup = Command::new(python)
-        .arg("-c")
-        .arg(concat!(
-            "import sys, pathlib, pyarrow as pa, pyarrow.parquet as pq\n",
-            "path = pathlib.Path(sys.argv[1])\n",
-            "pq.write_table(pa.table({'title': ['後'], 'rank': [2]}), path / '002.parquet')\n",
-            "pq.write_table(pa.table({'title': ['先'], 'rank': [1]}), path / '001.parquet')\n",
-        ))
-        .arg(&directory)
-        .output()
-        .unwrap();
-    assert!(
-        setup.status.success(),
-        "{}",
-        String::from_utf8_lossy(&setup.stderr)
-    );
+    use arrow::array::{Int64Array, StringArray};
+    use std::sync::Arc;
+
+    for (file, title, rank) in [("002.parquet", "後", 2), ("001.parquet", "先", 1)] {
+        write_parquet(
+            &directory.join(file),
+            vec![
+                ("title", Arc::new(StringArray::from(vec![title]))),
+                ("rank", Arc::new(Int64Array::from(vec![rank]))),
+            ],
+        );
+    }
     let scan = |sql| command_for("scan", &directory).arg(sql).output().unwrap();
     assert_eq!(
         rows(scan("SELECT _line, title FROM articles WHERE rank >= 1;")),
@@ -2065,35 +2070,49 @@ fn unusable_scratch_does_not_prevent_commands_that_need_no_scratch() {
 }
 
 #[test]
-#[ignore = "requires a Python with PyArrow; set JSQNL_PYTHON"]
-fn parquet_projection_timestamp_and_utf8_protocol() {
+fn parquet_projection_preserves_dotted_names_timestamps_and_utf8() {
     let db = Fixture::new(None);
     let path = db.file("my-data");
     fs::create_dir(&path).unwrap();
-    let python = std::env::var_os("JSQNL_PYTHON").unwrap_or_else(|| "python3".into());
-    let setup = Command::new(python)
-        .arg("-c")
-        .arg(concat!(
-            "import sys, pyarrow as pa, pyarrow.parquet as pq\n",
-            "stamp = pa.array([1700000000123456789], type=pa.timestamp('ns', 'UTC'))\n",
-            "nested = pa.StructArray.from_arrays([stamp], names=['ts'])\n",
-            "pq.write_table(pa.table({'a':[{'b':b'bytes'}], 'a.b':[42], 'ts':stamp, 'nested':nested, 'title':['雪']}), sys.argv[1])\n",
-        ))
-        .arg(path.join("one.parquet"))
-        .output().unwrap();
-    assert!(setup.status.success(), "{setup:?}");
-    for encoding in ["ascii", "utf-16"] {
-        let result = command_for("scan", &path)
-            .arg("SELECT a.b, ts, nested, title FROM \"my-data\" WHERE a.b = 42;")
-            .env("PYTHONIOENCODING", encoding)
-            .output()
-            .unwrap();
-        let stamp = "2023-11-14T22:13:20.123456789+00:00";
-        assert_eq!(
-            rows(result),
-            [json!({"a.b":42,"ts":stamp,"nested":{"ts":stamp},"title":"雪"})]
-        );
+    use arrow::array::{
+        Array, ArrayRef, BinaryArray, Int64Array, StringArray, StructArray,
+        TimestampNanosecondArray,
+    };
+    use arrow::datatypes::Field;
+    use std::sync::Arc;
+
+    fn structure(name: &str, values: ArrayRef) -> ArrayRef {
+        let field = Arc::new(Field::new(name, values.data_type().clone(), false));
+        Arc::new(StructArray::from(vec![(field, values)]))
     }
+
+    let stamp =
+        Arc::new(TimestampNanosecondArray::from(vec![1700000000123456789]).with_timezone("UTC"));
+    write_parquet(
+        &path.join("one.parquet"),
+        vec![
+            (
+                "a",
+                structure(
+                    "b",
+                    Arc::new(BinaryArray::from_vec(vec![b"bytes".as_slice()])),
+                ),
+            ),
+            ("a.b", Arc::new(Int64Array::from(vec![42]))),
+            ("ts", stamp.clone()),
+            ("nested", structure("ts", stamp)),
+            ("title", Arc::new(StringArray::from(vec!["雪"]))),
+        ],
+    );
+    let result = command_for("scan", &path)
+        .arg("SELECT a.b, ts, nested, title FROM \"my-data\" WHERE a.b = 42;")
+        .output()
+        .unwrap();
+    let stamp = "2023-11-14T22:13:20.123456789+00:00";
+    assert_eq!(
+        rows(result),
+        [json!({"a.b":42,"ts":stamp,"nested":{"ts":stamp},"title":"雪"})]
+    );
 }
 
 #[test]
@@ -2264,26 +2283,44 @@ fn jsonl_import_charges_the_bom_and_accepts_sql_widths() {
 }
 
 #[test]
-#[ignore = "requires a Python with PyArrow; set JSQNL_PYTHON"]
 fn parquet_preserves_temporal_values_and_handles_wide_projection() {
     let db = Fixture::new(None);
     let path = db.file("archive");
     fs::create_dir(&path).unwrap();
-    let python = std::env::var_os("JSQNL_PYTHON").unwrap_or_else(|| "python3".into());
-    let result = Command::new(python)
-        .arg("-c")
-        .arg(concat!(
-            "import pyarrow as a, pyarrow.parquet as pq, sys\n",
-            "cols={f'f{i:05d}':[i] for i in range(15000)}\n",
-            "cols['パリ']=a.array([-2208988800000000000],type=a.timestamp('ns','Europe/Paris'))\n",
-            "cols['future']=a.array([2932897],type=a.date32())\n",
-            "cols['clock']=a.array([123456789],type=a.time64('ns'))\n",
-            "pq.write_table(a.table(cols),sys.argv[1])\n"
-        ))
-        .arg(path.join("test.parquet"))
-        .output()
-        .unwrap();
-    assert!(result.status.success(), "{result:?}");
+    use arrow::array::{
+        ArrayRef, Date32Array, Int64Array, Time64NanosecondArray, TimestampNanosecondArray,
+    };
+    use std::sync::Arc;
+
+    let columns: Vec<_> = (0..15000).map(|i| format!("f{i:05}")).collect();
+    let mut arrays: Vec<(&str, ArrayRef)> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            (
+                name.as_str(),
+                Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef,
+            )
+        })
+        .collect();
+    arrays.extend([
+        (
+            "パリ",
+            Arc::new(
+                TimestampNanosecondArray::from(vec![-2208988800000000000])
+                    .with_timezone("Europe/Paris"),
+            ) as ArrayRef,
+        ),
+        (
+            "future",
+            Arc::new(Date32Array::from(vec![2932897])) as ArrayRef,
+        ),
+        (
+            "clock",
+            Arc::new(Time64NanosecondArray::from(vec![123456789])) as ArrayRef,
+        ),
+    ]);
+    write_parquet(&path.join("test.parquet"), arrays);
     let result = rows(
         command_for("scan", &path)
             .arg("SELECT \"パリ\",future,clock FROM archive;")
@@ -2296,12 +2333,11 @@ fn parquet_preserves_temporal_values_and_handles_wide_projection() {
             json!({"パリ":"1900-01-01T00:09:21.000000000+00:09:21","future":"+010000-01-01","clock":"00:00:00.123456789"})
         ]
     );
-    let fields: Vec<_> = (0..15000).map(|i| format!("f{i:05}")).collect();
     // Invoke the public API so the parent process's own argv limit is irrelevant.
     let mut output = Vec::new();
     jsqnl::scan_parquet(
         &path,
-        &format!("SELECT {} FROM archive;", fields.join(",")),
+        &format!("SELECT {} FROM archive;", columns.join(",")),
         |row| {
             output.push(row);
             Ok(())

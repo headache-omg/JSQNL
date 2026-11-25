@@ -47,7 +47,7 @@ JSQNL supports inner and left equijoins, grouped counts, sorting, pagination, an
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-IN2JSQNL combines one supported SQL `CREATE TABLE` definition with JSON or JSONL data. Parquet is available through a separate read-only `jsqnl scan` command with a locally installed PyArrow.
+IN2JSQNL combines one supported SQL `CREATE TABLE` definition with JSON or JSONL data. Parquet is available through a separate read-only `jsqnl scan` command.
 
 ## Storage and scale
 

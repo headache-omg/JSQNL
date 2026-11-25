@@ -68,7 +68,7 @@ IN2JSQNL объединяет одно поддерживаемое опреде
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-`scan` читает файлы Parquet с одинаковой схемой в порядке имён. Требуется установленный PyArrow. При необходимости укажите интерпретатор Python через `JSQNL_PYTHON`. Имя таблицы берётся из имени каталога. Для каталога `data` используется имя родительского каталога. За один запуск выполняется один запрос `SELECT`.
+`scan` читает файлы Parquet с одинаковой схемой в порядке имён. Имя таблицы берётся из имени каталога. Для каталога `data` используется имя родительского каталога. За один запуск выполняется один запрос `SELECT`.
 
 ```sh
 ./target/release/jsqnl scan /path/to/enwiki/data 'SELECT identifier FROM enwiki LIMIT 5;'

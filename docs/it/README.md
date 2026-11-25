@@ -68,7 +68,7 @@ IN2JSQNL combina una definizione SQL `CREATE TABLE` supportata con un oggetto JS
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-`scan` legge partizioni Parquet con lo stesso schema in ordine di nome. È necessaria un’installazione di PyArrow. Se serve, imposta `JSQNL_PYTHON` con il percorso del relativo interprete. Il nome della tabella deriva dalla directory o dalla sua directory superiore se si chiama `data`. Ogni scansione accetta un solo `SELECT` in sola lettura.
+`scan` legge partizioni Parquet con lo stesso schema in ordine di nome. Il nome della tabella deriva dalla directory o dalla sua directory superiore se si chiama `data`. Ogni scansione accetta un solo `SELECT` in sola lettura.
 
 ```sh
 ./target/release/jsqnl scan /path/to/enwiki/data 'SELECT identifier FROM enwiki LIMIT 5;'

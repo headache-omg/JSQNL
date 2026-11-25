@@ -20,7 +20,7 @@ This specification defines the base file exchanged between JSQNL implementations
 
 The schema spelling is `-- SCHEMA: table (column TYPE [NOT NULL] [PRIMARY KEY], ...)`. Readers also accept `SCHEMA table (...)` and an optional terminating semicolon. Format keywords and type names are ASCII case insensitive. Names are case sensitive and match `[A-Za-z_][A-Za-z_0-9]*`. Table and column names must be unique. A schema requires at least one column. `_line` is reserved.
 
-Each data object belongs to the most recent schema. A table has one contiguous section, which may contain comments and blank lines. A data object before any schema or an undeclared field is invalid. Members can appear in any order. Producers must write unique JSON member names. The current Rust and Python readers use the last value for duplicated JSON members.
+Each data object belongs to the most recent schema. A table has one contiguous section, which may contain comments and blank lines. A data object before any schema or an undeclared field is invalid. Members can appear in any order. Producers must write unique JSON member names. The current readers use the last value for duplicated JSON members.
 
 | Type | JSON value |
 | --- | --- |
@@ -45,4 +45,4 @@ A database with mutations also has an adjacent `.log` companion. Keep the base a
 
 The log version is independent of the base version. In the Rust engine, each log frame consists of a tag, a tab, a UTF-8 JSON transaction and LF. For transaction version 1, the tag is the lowercase ASCII-hex SHA-256 digest of the transaction bytes. For authenticated version 3, the tag is `hmac3:` followed by the lowercase ASCII-hex HMAC-SHA-256 using a separate 32-byte key. The authenticated byte sequence is the ASCII domain string `JSQNL journal v3`, a single zero byte, the canonical path byte length as unsigned 64-bit big-endian, the canonical path's platform-native Rust encoded bytes, and the transaction bytes. A fork re-authenticates committed transactions for the destination path. Legacy version 2 uses `hmac:` followed by HMAC-SHA-256 over only the transaction bytes. It can be read with an explicit compatibility flag or upgraded through a fork. The chain field in either version stores the SHA-256 digest of the preceding transaction bytes. The transaction binds the exact base bytes by SHA-256 and links to the preceding frame's hash. A final suffix without LF is uncommitted. Journal replay semantics remain implementation-specific. The `.idx`, `.seek.sqlite` and `.seek.sqlite.seal` indexes are derived files.
 
-The independent Python reader in `tests/reference_reader.py` and the embedded Rust API share the fixtures in `tests/api.rs`. Tests cover versioned and legacy files along with representative malformed input.
+The independent Rust reader in `tests/support/reference_reader.rs` and the embedded Rust API share the fixtures in `tests/api.rs`. Tests cover versioned and legacy files along with representative malformed input.

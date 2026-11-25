@@ -68,7 +68,7 @@ IN2JSQNL은 지원되는 SQL `CREATE TABLE` 정의 하나와 JSON 객체, 객체
 ./target/release/jsqnl exec imported.jsqnl 'SELECT name FROM users WHERE active = true;'
 ```
 
-`scan`은 동일한 스키마의 Parquet 분할 파일을 파일 이름 순서로 읽습니다. PyArrow가 설치되어 있어야 하며, 필요한 경우 `JSQNL_PYTHON`에 해당 Python 경로를 지정합니다. 테이블 이름은 디렉터리 이름을 사용합니다. 디렉터리가 `data`이면 상위 디렉터리 이름을 사용합니다. 한 번에 읽기 전용 `SELECT` 하나를 실행합니다.
+`scan`은 동일한 스키마의 Parquet 분할 파일을 파일 이름 순서로 읽습니다. 테이블 이름은 디렉터리 이름을 사용합니다. 디렉터리가 `data`이면 상위 디렉터리 이름을 사용합니다. 한 번에 읽기 전용 `SELECT` 하나를 실행합니다.
 
 ```sh
 ./target/release/jsqnl scan /path/to/enwiki/data 'SELECT identifier FROM enwiki LIMIT 5;'
